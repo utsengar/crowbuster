@@ -1,0 +1,12 @@
+Sound Attribution
+=================
+
+Crow distress / predator call audio downloaded from:
+  HME Products — Free Predator Calls
+  https://www.hmeproducts.com/sounds-download/
+
+These files are redistributed solely for use with the crowbuster
+project. All rights remain with HME Products.
+
+If you publish this repo, link back to the HME Products page
+above rather than hosting the mp3s on the public repo.
