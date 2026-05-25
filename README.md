@@ -327,6 +327,41 @@ On a 2012 ThinkPad (4-core Intel, 4GB RAM, no GPU):
 
 Plenty of headroom for the box to keep doing other things. To squeeze more performance: switch to multi-user boot (`sudo systemctl set-default multi-user.target`) and skip the GUI entirely.
 
+## Aiming the camera at the nest
+
+The repo includes a small `preview.py` that opens the same webcam crowbuster uses, with a centered crosshair and rule-of-thirds grid overlaid so you can frame the nest properly. Sit at the laptop physically (or use VNC / X forwarding) and run:
+
+```bash
+# 1. Free the camera (the running service holds it)
+systemctl --user stop crowbuster
+
+# 2. Open the live preview
+source .venv/bin/activate
+python3 preview.py
+# Aim the laptop at the nest while watching the green crosshair.
+# Press 'q' in the window to quit.
+
+# 3. Restart the service
+systemctl --user start crowbuster
+```
+
+Tips for framing:
+- Put the nest near a rule-of-thirds intersection (the yellow grid crossings), not dead-center — Claude classifies better when the bird is in context
+- Keep the nest in the upper third so most of the frame is the empty porch, which keeps the motion baseline calm
+- Aim a hair *above* the nest if possible — birds approach from above, so you want to see the landing
+
+### Alternative: Cheese
+
+If you prefer a full GUI webcam app:
+
+```bash
+sudo apt install -y cheese
+systemctl --user stop crowbuster   # release the camera
+cheese
+```
+
+Cheese gives you a generic preview window but doesn't draw the framing grid — it's mainly useful as a sanity check that the camera works at all.
+
 ## Troubleshooting
 
 ### 🆘 The screen is stuck off and I can't get it back
