@@ -1,0 +1,29 @@
+[Unit]
+Description=crowbuster — egg-protection sentry
+Documentation=https://github.com/utsengar/crowbuster
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/crowbuster
+ExecStart=%h/crowbuster/.venv/bin/python %h/crowbuster/crowbuster.py
+
+# Restart on any non-clean exit (crash, kill, network failure, OOM, etc.)
+Restart=always
+RestartSec=10
+
+# Allow up to 50 restart attempts in a 10-minute window before giving up.
+# In practice this should be plenty — the script is robust.
+StartLimitIntervalSec=600
+StartLimitBurst=50
+
+# Required for the screen-control xset commands.
+Environment="DISPLAY=:0"
+
+# Drop output into the systemd journal so you can tail it with journalctl.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

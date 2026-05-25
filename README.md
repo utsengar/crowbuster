@@ -228,14 +228,34 @@ brew install fswatch       # macOS
 
 Every file change triggers an `rsync --delete` to the remote host within a second. `sync.sh` reads `REMOTE_USER`, `REMOTE_HOST`, and `REMOTE_PATH` from `.env` (or from your shell env).
 
-### Run on boot
+### Run forever (auto-restart on crash, start on boot)
+
+The repo ships a systemd user service that:
+
+- Starts crowbuster at boot
+- Restarts automatically on any crash (up to 50 times per 10 minutes)
+- Keeps running when you log out (via `loginctl enable-linger`)
+- Captures stdout + stderr in the journal
+
+One-shot install on the run host:
 
 ```bash
-crontab -e
-# add:
-@reboot sleep 30 && cd /home/$USER/crowbuster && \
-  .venv/bin/python crowbuster.py >> events.log 2>&1
+./install-service.sh
 ```
+
+That copies `crowbuster.service` to `~/.config/systemd/user/`, enables it, starts it, and enables user lingering so the service survives logouts.
+
+Day-to-day operations:
+
+```bash
+systemctl --user status crowbuster        # current state
+journalctl --user -u crowbuster -f        # tail the live log
+systemctl --user restart crowbuster       # restart after editing the script
+systemctl --user stop crowbuster          # pause it
+systemctl --user disable --now crowbuster # uninstall the service
+```
+
+The service runs from the `.venv` so you don't need to activate it manually. Edit `crowbuster.service` if you want to change the restart policy, add environment variables, or run from a different path.
 
 ### Reviewing captures
 
