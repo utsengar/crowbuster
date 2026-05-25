@@ -197,7 +197,9 @@ Tweak the constants at the top of `crowbuster.py`:
 | `CAMERA_INDEX` | `0` | Built-in webcam. `1`, `2`, ... for USB cameras. |
 | `DAYLIGHT_START` / `_END` | `5:30` / `20:30` | Sleep through the night — crows don't hunt then. |
 | `TEST_MODE` | env var | Set `CROWBUSTER_TEST=1` to detect humans for testing. |
-| `CONTROL_SCREEN` | env var | Set `CROWBUSTER_NO_SCREEN_CONTROL=1` to disable. By default, the script turns the display off at startup and restores it on exit (Ctrl+C, SIGTERM, or crash). When the script isn't running, the laptop behaves normally. |
+| `CONTROL_SCREEN` | env var | Set `CROWBUSTER_NO_SCREEN_CONTROL=1` to disable. By default, the script turns the display off at startup, disables the screensaver, and re-asserts the off state every 30s in a background thread (so the screensaver can't wake it). On exit (Ctrl+C, SIGTERM, or crash) the screensaver + DPMS are restored and the screen turned back on. When the script isn't running, the laptop behaves normally. |
+
+> **Test-mode timing override:** when `CROWBUSTER_TEST=1`, `PERSISTENT_REFIRE_SECONDS` drops to 10 and `TARGET_GONE_AFTER_N_EMPTY` drops to 3. This makes the full pipeline (rising-edge → persistent-refire → habituated-crow alarm) reachable in ~30 seconds of standing in frame, instead of ~7 minutes. Production timings are unchanged.
 
 ## Cost
 

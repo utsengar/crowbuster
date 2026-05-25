@@ -20,6 +20,7 @@ import random
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -85,7 +86,12 @@ CAMERA_INDEX = 0
 
 # Test mode — detect humans instead of crows so you can stand in front of the
 # camera and verify the full pipeline works. Enable with: CROWBUSTER_TEST=1
+# In test mode we shorten the refire/empty thresholds so the persistent-refire
+# and habituation alarm paths are reachable in ~30 seconds of standing in frame.
 TEST_MODE = os.environ.get("CROWBUSTER_TEST", "0") == "1"
+if TEST_MODE:
+    PERSISTENT_REFIRE_SECONDS = 10
+    TARGET_GONE_AFTER_N_EMPTY = 3
 TARGET_YOLO_CLASS = "person" if TEST_MODE else "bird"
 TARGET_DESCRIPTION = "human" if TEST_MODE else "crow"
 TARGET_PROMPT = (
@@ -247,31 +253,66 @@ def write_heartbeat() -> None:
     HEARTBEAT_FILE.write_text(datetime.now().isoformat(timespec="seconds"))
 
 
-def _set_screen(state: str) -> None:
-    """Turn the display on/off via xset DPMS. Best-effort, silent if X isn't reachable."""
+_screen_keeper_stop = threading.Event()
+_screen_keeper_thread: threading.Thread | None = None
+
+
+def _xset(*args: str) -> bool:
+    """Run an xset command, best-effort. Returns True on success."""
+    env = {**os.environ, "DISPLAY": SCREEN_DISPLAY}
+    # Try common Xauthority locations so this works whether launched from inside
+    # the X session or over SSH.
+    for candidate in (
+        os.environ.get("XAUTHORITY"),
+        f"/run/user/{os.getuid()}/gdm/Xauthority",
+        f"/home/{os.environ.get('USER', '')}/.Xauthority",
+    ):
+        if candidate and Path(candidate).exists():
+            env["XAUTHORITY"] = candidate
+            break
+    try:
+        return subprocess.run(
+            ["xset", *args], env=env, capture_output=True, text=True, timeout=5
+        ).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _screen_keeper_loop() -> None:
+    """Re-issue dpms-force-off every 30s — survives X events that wake the screen."""
+    while not _screen_keeper_stop.is_set():
+        _xset("dpms", "force", "off")
+        _screen_keeper_stop.wait(30)
+
+
+def screen_off() -> None:
+    """Turn the display off and keep it off until screen_on() runs."""
     if not CONTROL_SCREEN:
         return
-    env = {**os.environ, "DISPLAY": SCREEN_DISPLAY}
-    # Use loginctl/find current Xauthority — works whether we're in the X session or over SSH.
-    xauth = Path(f"/run/user/{os.getuid()}/gdm/Xauthority")
-    if xauth.exists():
-        env["XAUTHORITY"] = str(xauth)
-    try:
-        result = subprocess.run(
-            ["xset", "dpms", "force", state],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            log(f"display turned {state}")
-        else:
-            log(f"display control failed ({state}): {result.stderr.strip() or 'unknown'}")
-    except FileNotFoundError:
-        log("xset not installed — skipping screen control")
-    except subprocess.TimeoutExpired:
-        log(f"display control timed out ({state})")
+    # Disable the screensaver + DPMS timing so nothing fights us
+    _xset("s", "off")
+    _xset("s", "noblank")
+    _xset("-dpms")
+    ok = _xset("dpms", "force", "off")
+    log(f"display turned off{'' if ok else ' (xset failed — screen may stay on)'}")
+    # Start the keeper thread to re-assert off if something wakes the screen
+    global _screen_keeper_thread
+    _screen_keeper_stop.clear()
+    _screen_keeper_thread = threading.Thread(target=_screen_keeper_loop, daemon=True)
+    _screen_keeper_thread.start()
+
+
+def screen_on() -> None:
+    """Stop the keeper thread, restore screensaver/DPMS, turn the screen back on."""
+    if not CONTROL_SCREEN:
+        return
+    _screen_keeper_stop.set()
+    if _screen_keeper_thread is not None:
+        _screen_keeper_thread.join(timeout=2)
+    _xset("+dpms")          # restore DPMS power management
+    _xset("s", "default")   # restore default screensaver timeout
+    _xset("dpms", "force", "on")
+    log("display turned on")
 
 
 def print_banner() -> None:
@@ -314,12 +355,12 @@ def main() -> None:
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, _on_sigterm)
 
-    _set_screen("off")
+    screen_off()
 
     cam = cv2.VideoCapture(CAMERA_INDEX)
     if not cam.isOpened():
         log("FATAL: cannot open camera")
-        _set_screen("on")
+        screen_on()
         return
 
     # Prime prev_frame so the first iteration computes a real diff (no fake "motion started 0.0")
@@ -457,7 +498,7 @@ def main() -> None:
         log("shutdown requested")
     finally:
         cam.release()
-        _set_screen("on")
+        screen_on()
 
 
 if __name__ == "__main__":
