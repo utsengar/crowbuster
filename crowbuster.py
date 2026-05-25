@@ -17,6 +17,8 @@ import base64
 import contextlib
 import os
 import random
+import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, time as dtime
@@ -61,6 +63,11 @@ LOOP_INTERVAL = 1                  # seconds between motion checks
 TARGET_GONE_AFTER_N_EMPTY = 5      # consecutive YOLO misses before "target left"
 PERSISTENT_REFIRE_SECONDS = 210    # re-fire if target stays in frame this long (stubborn crow)
 HABITUATION_THRESHOLD = 2          # consecutive persistent-refires before sounding human alarm
+
+# Turn the display off while crowbuster is running, back on when it exits.
+# Disable by setting CROWBUSTER_NO_SCREEN_CONTROL=1 (headless boxes, multi-user.target).
+CONTROL_SCREEN = os.environ.get("CROWBUSTER_NO_SCREEN_CONTROL", "0") != "1"
+SCREEN_DISPLAY = os.environ.get("DISPLAY", ":0")
 BASELINE_DETERRENT_MINUTES = 30    # play a sound this often regardless (insurance)
 MAX_PLAY_SECONDS = 45              # cap sound playback (long files won't stall detection)
 MAX_CAPTURES = 500                 # keep at most this many capture jpgs (~25-50 MB)
@@ -240,6 +247,33 @@ def write_heartbeat() -> None:
     HEARTBEAT_FILE.write_text(datetime.now().isoformat(timespec="seconds"))
 
 
+def _set_screen(state: str) -> None:
+    """Turn the display on/off via xset DPMS. Best-effort, silent if X isn't reachable."""
+    if not CONTROL_SCREEN:
+        return
+    env = {**os.environ, "DISPLAY": SCREEN_DISPLAY}
+    # Use loginctl/find current Xauthority — works whether we're in the X session or over SSH.
+    xauth = Path(f"/run/user/{os.getuid()}/gdm/Xauthority")
+    if xauth.exists():
+        env["XAUTHORITY"] = str(xauth)
+    try:
+        result = subprocess.run(
+            ["xset", "dpms", "force", state],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            log(f"display turned {state}")
+        else:
+            log(f"display control failed ({state}): {result.stderr.strip() or 'unknown'}")
+    except FileNotFoundError:
+        log("xset not installed — skipping screen control")
+    except subprocess.TimeoutExpired:
+        log(f"display control timed out ({state})")
+
+
 def print_banner() -> None:
     """A friendly startup banner so you know exactly what's loaded."""
     BOLD, DIM, CYAN, YELLOW, RESET = "\033[1m", "\033[2m", "\033[36m", "\033[33m", "\033[0m"
@@ -275,9 +309,17 @@ def main() -> None:
     log(f"crowbuster started [{'TEST' if TEST_MODE else 'production'}]")
     prune_captures()  # clean up any backlog from a long-stopped previous run
 
+    # Translate SIGTERM into KeyboardInterrupt so the finally block restores the screen.
+    def _on_sigterm(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+    _set_screen("off")
+
     cam = cv2.VideoCapture(CAMERA_INDEX)
     if not cam.isOpened():
         log("FATAL: cannot open camera")
+        _set_screen("on")
         return
 
     # Prime prev_frame so the first iteration computes a real diff (no fake "motion started 0.0")
@@ -415,6 +457,7 @@ def main() -> None:
         log("shutdown requested")
     finally:
         cam.release()
+        _set_screen("on")
 
 
 if __name__ == "__main__":
