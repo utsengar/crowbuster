@@ -172,9 +172,11 @@ Tweak the constants at the top of `crowbuster.py`:
 |---|---|---|
 | `LOOP_INTERVAL` | `1` | Seconds between motion checks. Lower = faster reaction, more CPU. |
 | `TARGET_GONE_AFTER_N_EMPTY` | `5` | Consecutive YOLO misses before considering the target gone (resets rising-edge). |
-| `PERSISTENT_REFIRE_SECONDS` | `180` | Re-fire if a target stays in frame this long. Stubborn-crow insurance. |
+| `PERSISTENT_REFIRE_SECONDS` | `210` | Re-fire if a target stays in frame this long. Stubborn-crow insurance. |
 | `BASELINE_DETERRENT_MINUTES` | `30` | Random distress sound every N minutes regardless of detection. |
-| `MAX_PLAY_SECONDS` | `15` | Truncate long audio files; keeps detection loop responsive. |
+| `MAX_PLAY_SECONDS` | `45` | Truncate long audio files; keeps detection loop responsive. |
+| `MAX_CAPTURES` | `500` | Cap on `captures/` folder size (~25–50 MB). Oldest pruned first. |
+| `CAPTURE_PRUNE_EVERY` | `20` | Check folder size every Nth save (avoids per-save filesystem stat). |
 | `MOTION_THRESHOLD` | `8.0` | Lower = more sensitive. Tune by watching `captures/`. |
 | `YOLO_BIRD_CONFIDENCE` | `0.25` | Permissive on purpose — false positives are cheap. |
 | `YOLO_FORCE_CHECK_EVERY` | `30` | Run YOLO every Nth iteration even without motion (catches silent landings). |
@@ -230,6 +232,8 @@ ls -lt captures/ | head -20
 ```
 
 If you see crows tagged `bird_not_crow`, the Claude prompt or model needs tuning. If you see lots of empty-frame triggers, raise `MOTION_THRESHOLD`. If you see crows you missed entirely, lower it.
+
+The folder caps itself at `MAX_CAPTURES` (default 500) — oldest files are pruned automatically. You'll see `pruned N old captures` in the log when this happens.
 
 ### Performance on old hardware
 

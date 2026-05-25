@@ -14,14 +14,32 @@ See ./sounds/SOURCES.txt for full attribution.
 """
 
 import base64
+import contextlib
 import os
 import random
+import sys
 import time
 from datetime import datetime, time as dtime
 from pathlib import Path
 
-# Disable NNPACK before torch imports — old CPUs lack the required instructions
+# Suppress noisy startup messages before importing pygame / torch
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "hide")
 os.environ.setdefault("TORCH_NNPACK", "0")
+
+
+@contextlib.contextmanager
+def _silenced_stderr():
+    """Swallow C-level stderr (e.g. NNPACK warnings) during a wrapped call."""
+    devnull = open(os.devnull, "w")
+    saved_fd = os.dup(2)
+    try:
+        os.dup2(devnull.fileno(), 2)
+        yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+        devnull.close()
 
 import anthropic
 import cv2
@@ -40,9 +58,11 @@ HEARTBEAT_FILE = HERE / "heartbeat"
 
 LOOP_INTERVAL = 1                  # seconds between motion checks
 TARGET_GONE_AFTER_N_EMPTY = 5      # consecutive YOLO misses before "target left"
-PERSISTENT_REFIRE_SECONDS = 180    # re-fire if target stays in frame this long (stubborn crow)
+PERSISTENT_REFIRE_SECONDS = 210    # re-fire if target stays in frame this long (stubborn crow)
 BASELINE_DETERRENT_MINUTES = 30    # play a sound this often regardless (insurance)
-MAX_PLAY_SECONDS = 15              # cap sound playback (long files won't stall detection)
+MAX_PLAY_SECONDS = 45              # cap sound playback (long files won't stall detection)
+MAX_CAPTURES = 500                 # keep at most this many capture jpgs (~25-50 MB)
+CAPTURE_PRUNE_EVERY = 20           # check captures/ folder size every Nth save
 HEARTBEAT_SECONDS = 60             # write heartbeat file every N seconds
 STATS_INTERVAL_SECONDS = 300       # log pipeline stats every N seconds
 
@@ -105,7 +125,8 @@ def has_motion(prev, curr) -> tuple[bool, float]:
 
 def detect_bird(frame) -> tuple[bool, float]:
     """Stage 2: local YOLO. Returns (found, best_confidence) for the target class."""
-    results = yolo(frame, verbose=False)
+    with _silenced_stderr():
+        results = yolo(frame, verbose=False)
     max_conf = 0.0
     for r in results:
         for box in r.boxes:
@@ -177,24 +198,75 @@ def play_distress(reason: str) -> None:
         time.sleep(0.1)
 
 
+_save_count = 0
+
+
 def save_capture(frame, label: str) -> None:
+    global _save_count
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cv2.imwrite(str(CAPTURES_DIR / f"{ts}_{label}.jpg"), frame)
+    path = CAPTURES_DIR / f"{ts}_{label}.jpg"
+    cv2.imwrite(str(path), frame)
+    _save_count += 1
+    if _save_count % CAPTURE_PRUNE_EVERY == 0:
+        prune_captures()
+
+
+def prune_captures() -> None:
+    """Keep only the newest MAX_CAPTURES jpgs in captures/."""
+    files = sorted(CAPTURES_DIR.glob("*.jpg"))  # ascending = oldest first
+    excess = len(files) - MAX_CAPTURES
+    if excess > 0:
+        for f in files[:excess]:
+            f.unlink(missing_ok=True)
+        log(f"pruned {excess} old captures (folder capped at {MAX_CAPTURES})")
 
 
 def write_heartbeat() -> None:
     HEARTBEAT_FILE.write_text(datetime.now().isoformat(timespec="seconds"))
 
 
+def print_banner() -> None:
+    """A friendly startup banner so you know exactly what's loaded."""
+    BOLD, DIM, CYAN, YELLOW, RESET = "\033[1m", "\033[2m", "\033[36m", "\033[33m", "\033[0m"
+    mode = (
+        f"{YELLOW}TEST MODE{RESET} {DIM}(target=human){RESET}"
+        if TEST_MODE
+        else f"{CYAN}production{RESET} {DIM}(target=crow){RESET}"
+    )
+    sound_count = len(list(SOUNDS_DIR.glob("*.mp3")))
+    capture_count = len(list(CAPTURES_DIR.glob("*.jpg")))
+
+    print(f"""
+  {CYAN}▸{RESET} {BOLD}crowbuster{RESET} {DIM}— operation eggsafe{RESET}
+  {DIM}watching the porch · saving the eggs{RESET}
+
+  {DIM}mode      {RESET}{mode}
+  {DIM}model     {RESET}{MODEL}
+  {DIM}loop      {RESET}every {LOOP_INTERVAL}s
+  {DIM}refire    {RESET}after {PERSISTENT_REFIRE_SECONDS}s if target persists
+  {DIM}playback  {RESET}up to {MAX_PLAY_SECONDS}s per sound
+  {DIM}sounds    {RESET}{sound_count} mp3 file{'s' if sound_count != 1 else ''} loaded
+  {DIM}captures  {RESET}{capture_count} existing (max {MAX_CAPTURES})
+  {DIM}daylight  {RESET}{DAYLIGHT_START.strftime('%H:%M')} – {DAYLIGHT_END.strftime('%H:%M')}
+
+  {CYAN}▸{RESET} {DIM}pipeline starting{RESET}
+""")
+
+
 def main() -> None:
-    mode = f"TEST_MODE (target={TARGET_DESCRIPTION})" if TEST_MODE else "production"
-    log(f"crowbuster started [{mode}] (model={MODEL}, loop={LOOP_INTERVAL}s)")
+    print_banner()
+    log(f"crowbuster started [{'TEST' if TEST_MODE else 'production'}]")
+    prune_captures()  # clean up any backlog from a long-stopped previous run
+
     cam = cv2.VideoCapture(CAMERA_INDEX)
     if not cam.isOpened():
         log("FATAL: cannot open camera")
         return
 
-    prev_frame = None
+    # Prime prev_frame so the first iteration computes a real diff (no fake "motion started 0.0")
+    ok, prev_frame = cam.read()
+    if not ok:
+        prev_frame = None
     was_motion = False
     target_present = False     # set True after a confirmed crow; clears after N empty YOLO frames
     empty_yolo_count = 0
@@ -300,9 +372,10 @@ def main() -> None:
 
             if confirmed:
                 stats["crows"] += 1
+                trigger_kind = "persistent-refire" if target_present else "rising-edge"
                 target_present = True
                 save_capture(frame, TARGET_DESCRIPTION)
-                play_distress(reason=TARGET_DESCRIPTION)
+                play_distress(reason=f"{TARGET_DESCRIPTION}, {trigger_kind}")
                 last_trigger = now
             else:
                 save_capture(frame, f"{TARGET_YOLO_CLASS}_not_{TARGET_DESCRIPTION}")
