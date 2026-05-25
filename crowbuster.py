@@ -42,6 +42,7 @@ LOOP_INTERVAL = 1                  # seconds between motion checks
 TARGET_GONE_AFTER_N_EMPTY = 5      # consecutive YOLO misses before "target left"
 PERSISTENT_REFIRE_SECONDS = 180    # re-fire if target stays in frame this long (stubborn crow)
 BASELINE_DETERRENT_MINUTES = 30    # play a sound this often regardless (insurance)
+MAX_PLAY_SECONDS = 15              # cap sound playback (long files won't stall detection)
 HEARTBEAT_SECONDS = 60             # write heartbeat file every N seconds
 STATS_INTERVAL_SECONDS = 300       # log pipeline stats every N seconds
 
@@ -167,7 +168,12 @@ def play_distress(reason: str) -> None:
     pygame.mixer.music.load(str(sound))
     pygame.mixer.music.play()
     log(f"🚨 SPEAKER FIRED ({reason}) — playing {sound.name}")
+    start = time.time()
     while pygame.mixer.music.get_busy():
+        if time.time() - start > MAX_PLAY_SECONDS:
+            pygame.mixer.music.stop()
+            log(f"  (truncated playback at {MAX_PLAY_SECONDS}s)")
+            break
         time.sleep(0.1)
 
 

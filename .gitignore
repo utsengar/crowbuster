@@ -2,8 +2,9 @@
 .venv/
 __pycache__/
 *.pyc
-sounds/*.mp3
-!sounds/SOURCES.txt
+# mp3s are committed; ignore only if you want to keep your variants out
+# sounds/*.mp3
+# !sounds/SOURCES.txt
 events.log
 heartbeat
 captures/
