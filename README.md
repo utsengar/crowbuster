@@ -329,38 +329,19 @@ Plenty of headroom for the box to keep doing other things. To squeeze more perfo
 
 ## Aiming the camera at the nest
 
-The repo includes a small `preview.py` that opens the same webcam crowbuster uses, with a centered crosshair and rule-of-thirds grid overlaid so you can frame the nest properly. Sit at the laptop physically (or use VNC / X forwarding) and run:
+Use VLC (or any video capture tool) to view the webcam feed while you tilt the laptop into position. The camera can only be open in one process at a time, so stop the service first:
 
 ```bash
-# 1. Free the camera (the running service holds it)
-systemctl --user stop crowbuster
-
-# 2. Open the live preview
-source .venv/bin/activate
-python3 preview.py
-# Aim the laptop at the nest while watching the green crosshair.
-# Press 'q' in the window to quit.
-
-# 3. Restart the service
-systemctl --user start crowbuster
+systemctl --user stop crowbuster   # release the camera
+vlc v4l2:///dev/video0             # or open VLC and pick Media → Open Capture Device
+# aim the laptop while watching the feed, then close VLC
+systemctl --user start crowbuster  # bring crowbuster back up
 ```
 
 Tips for framing:
-- Put the nest near a rule-of-thirds intersection (the yellow grid crossings), not dead-center — Claude classifies better when the bird is in context
-- Keep the nest in the upper third so most of the frame is the empty porch, which keeps the motion baseline calm
-- Aim a hair *above* the nest if possible — birds approach from above, so you want to see the landing
-
-### Alternative: Cheese
-
-If you prefer a full GUI webcam app:
-
-```bash
-sudo apt install -y cheese
-systemctl --user stop crowbuster   # release the camera
-cheese
-```
-
-Cheese gives you a generic preview window but doesn't draw the framing grid — it's mainly useful as a sanity check that the camera works at all.
+- Place the nest near one of the rule-of-thirds intersections rather than dead-center — Claude classifies better when the bird is in context
+- Keep the nest in the upper third so most of the frame is empty porch, which keeps the motion baseline calm
+- Aim slightly *above* the nest — crows approach from above, so you want to see the landing
 
 ## Troubleshooting
 
