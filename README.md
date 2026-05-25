@@ -257,6 +257,54 @@ systemctl --user disable --now crowbuster # uninstall the service
 
 The service runs from the `.venv` so you don't need to activate it manually. Edit `crowbuster.service` if you want to change the restart policy, add environment variables, or run from a different path.
 
+### Monitor the running service from a dev machine
+
+Once the service is installed, you rarely need to be physically at the run host. SSH from your dev machine for everything.
+
+**Single-shot health check** — is it running and producing fresh heartbeats?
+
+```bash
+ssh <user>@<run-host> 'systemctl --user is-active crowbuster && cat ~/crowbuster/heartbeat'
+```
+
+Expected output: `active` followed by a timestamp from the last 60 seconds. If `is-active` returns something other than `active`, or the heartbeat is more than ~2 minutes stale, the service is in trouble.
+
+**Tail the live log:**
+
+```bash
+ssh <user>@<run-host> 'journalctl --user -u crowbuster -f'
+```
+
+**Recent activity / stats:**
+
+```bash
+ssh <user>@<run-host> 'journalctl --user -u crowbuster --since "1 hour ago" | grep -E "FIRED|stats|ALARM"'
+```
+
+**Quick capture review** — copy the most recent triggered frames back to your dev machine:
+
+```bash
+ssh <user>@<run-host> 'ls -t ~/crowbuster/captures/ | head -5' \
+  | xargs -I{} scp <user>@<run-host>:~/crowbuster/captures/{} ~/Desktop/
+```
+
+**Recommended aliases** — drop these into your dev machine's `~/.zshrc` (or `~/.bashrc`):
+
+```bash
+# Reads REMOTE_USER and REMOTE_HOST from your environment so the same
+# aliases work for any run host. Set them once in your shell rc:
+export REMOTE_USER=your-username
+export REMOTE_HOST=192.168.1.x
+
+alias cb-status='ssh $REMOTE_USER@$REMOTE_HOST "systemctl --user is-active crowbuster && cat ~/crowbuster/heartbeat"'
+alias cb-logs='ssh $REMOTE_USER@$REMOTE_HOST "journalctl --user -u crowbuster -f"'
+alias cb-restart='ssh $REMOTE_USER@$REMOTE_HOST "systemctl --user restart crowbuster"'
+alias cb-fires='ssh $REMOTE_USER@$REMOTE_HOST "journalctl --user -u crowbuster --since today | grep FIRED"'
+alias cb-screen-on='ssh $REMOTE_USER@$REMOTE_HOST "DISPLAY=:0 xset dpms force on"'
+```
+
+After `source ~/.zshrc`, you can run `cb-status`, `cb-logs`, `cb-fires`, etc. from anywhere on your dev machine.
+
 ### Reviewing captures
 
 `captures/` fills up with timestamped jpgs labeled `crow` (Claude confirmed) or `bird_not_crow` (Claude said no). Scroll through periodically:
