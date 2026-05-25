@@ -38,7 +38,6 @@ RSYNC_ARGS=(
   --exclude='heartbeat'
   --exclude='captures'
   --exclude='.git'
-  --exclude='.env'
   --exclude='yolov8n.pt'
 )
 

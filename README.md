@@ -76,9 +76,11 @@ Download mp3s from [HME Products — Free Predator Calls](https://www.hmeproduct
 Grab one at [console.anthropic.com](https://console.anthropic.com) → API Keys, then:
 
 ```bash
-echo 'export ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.bashrc
-source ~/.bashrc
+cp .env.example .env
+# edit .env and set ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+`crowbuster.py` auto-loads `.env` via `python-dotenv`. `.env` is gitignored, so your key stays out of the repo. If you'd rather use a shell env var, that works too — `os.environ` takes precedence.
 
 ### 5. Pair the Bluetooth speaker
 
