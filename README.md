@@ -41,6 +41,16 @@ A false positive plays an extra speaker sound. A false negative means dead eggs.
 - YOLO confidence low (0.25 threshold) → still escalate to Claude
 - Claude API errors, network out, or unclear response → **fire the speaker anyway**
 
+### Habituated-crow escalation
+
+Crows learn fast. After ~10–20 exposures to the same stimulus, they figure out the speaker is harmless and ignore it. crowbuster detects this and escalates:
+
+1. **First detection** — random distress sound (rising-edge fire)
+2. **3.5 minutes later, crow still there** — different distress sound (persistent-refire #1)
+3. **7 minutes in, still there** — `🆘 HUMAN ALARM` plays `sounds/alarm.wav` — a sound *you* will recognize and respond to by physically going outside
+
+Add `sounds/alarm.wav` to enable. The script falls back to a regular distress sound if it's missing. The counter resets the moment the crow leaves the frame, so a determined-but-mobile crow won't trigger the alarm; only a truly habituated one that refuses to budge does.
+
 ### Safeguards that work even if detection is broken
 
 - **Baseline deterrent** — plays a random distress sound every ~30 minutes regardless of detection. Crows learn the location = noise = bad. Free insurance against the entire pipeline failing.
@@ -173,6 +183,7 @@ Tweak the constants at the top of `crowbuster.py`:
 | `LOOP_INTERVAL` | `1` | Seconds between motion checks. Lower = faster reaction, more CPU. |
 | `TARGET_GONE_AFTER_N_EMPTY` | `5` | Consecutive YOLO misses before considering the target gone (resets rising-edge). |
 | `PERSISTENT_REFIRE_SECONDS` | `210` | Re-fire if a target stays in frame this long. Stubborn-crow insurance. |
+| `HABITUATION_THRESHOLD` | `2` | Persistent-refires in a row before playing `sounds/alarm.wav` to summon a human. |
 | `BASELINE_DETERRENT_MINUTES` | `30` | Random distress sound every N minutes regardless of detection. |
 | `MAX_PLAY_SECONDS` | `45` | Truncate long audio files; keeps detection loop responsive. |
 | `MAX_CAPTURES` | `500` | Cap on `captures/` folder size (~25–50 MB). Oldest pruned first. |

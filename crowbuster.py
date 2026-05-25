@@ -55,10 +55,12 @@ SOUNDS_DIR = HERE / "sounds"
 CAPTURES_DIR = HERE / "captures"   # frames that triggered (for review/tuning)
 LOG_FILE = HERE / "events.log"
 HEARTBEAT_FILE = HERE / "heartbeat"
+ALARM_SOUND = SOUNDS_DIR / "alarm.wav"  # special human-summoning alarm for habituated crows
 
 LOOP_INTERVAL = 1                  # seconds between motion checks
 TARGET_GONE_AFTER_N_EMPTY = 5      # consecutive YOLO misses before "target left"
 PERSISTENT_REFIRE_SECONDS = 210    # re-fire if target stays in frame this long (stubborn crow)
+HABITUATION_THRESHOLD = 2          # consecutive persistent-refires before sounding human alarm
 BASELINE_DETERRENT_MINUTES = 30    # play a sound this often regardless (insurance)
 MAX_PLAY_SECONDS = 45              # cap sound playback (long files won't stall detection)
 MAX_CAPTURES = 500                 # keep at most this many capture jpgs (~25-50 MB)
@@ -175,6 +177,19 @@ def is_crow(frame) -> bool:
 _sound_deck: list[Path] = []  # shuffle-bag — cycles through all sounds before repeating
 
 
+def _play_file(path: Path, log_line: str) -> None:
+    pygame.mixer.music.load(str(path))
+    pygame.mixer.music.play()
+    log(log_line)
+    start = time.time()
+    while pygame.mixer.music.get_busy():
+        if time.time() - start > MAX_PLAY_SECONDS:
+            pygame.mixer.music.stop()
+            log(f"  (truncated playback at {MAX_PLAY_SECONDS}s)")
+            break
+        time.sleep(0.1)
+
+
 def play_distress(reason: str) -> None:
     global _sound_deck
     if not _sound_deck:
@@ -184,18 +199,18 @@ def play_distress(reason: str) -> None:
             return
         _sound_deck = sounds.copy()
         random.shuffle(_sound_deck)
-
     sound = _sound_deck.pop()
-    pygame.mixer.music.load(str(sound))
-    pygame.mixer.music.play()
-    log(f"🚨 SPEAKER FIRED ({reason}) — playing {sound.name}")
-    start = time.time()
-    while pygame.mixer.music.get_busy():
-        if time.time() - start > MAX_PLAY_SECONDS:
-            pygame.mixer.music.stop()
-            log(f"  (truncated playback at {MAX_PLAY_SECONDS}s)")
-            break
-        time.sleep(0.1)
+    _play_file(sound, f"🚨 SPEAKER FIRED ({reason}) — playing {sound.name}")
+
+
+def play_alarm(reason: str) -> None:
+    """Play the dedicated human-summoning alarm. Falls back to a regular distress
+    sound if alarm.wav isn't present yet."""
+    if ALARM_SOUND.exists():
+        _play_file(ALARM_SOUND, f"🆘 HUMAN ALARM ({reason}) — playing {ALARM_SOUND.name}")
+    else:
+        log(f"alarm sound not found at {ALARM_SOUND.name} — falling back to distress")
+        play_distress(reason)
 
 
 _save_count = 0
@@ -235,6 +250,7 @@ def print_banner() -> None:
     )
     sound_count = len(list(SOUNDS_DIR.glob("*.mp3")))
     capture_count = len(list(CAPTURES_DIR.glob("*.jpg")))
+    alarm_status = "ready" if ALARM_SOUND.exists() else f"missing ({ALARM_SOUND.name})"
 
     print(f"""
   {CYAN}▸{RESET} {BOLD}crowbuster{RESET} {DIM}— operation eggsafe{RESET}
@@ -246,6 +262,7 @@ def print_banner() -> None:
   {DIM}refire    {RESET}after {PERSISTENT_REFIRE_SECONDS}s if target persists
   {DIM}playback  {RESET}up to {MAX_PLAY_SECONDS}s per sound
   {DIM}sounds    {RESET}{sound_count} mp3 file{'s' if sound_count != 1 else ''} loaded
+  {DIM}alarm     {RESET}{alarm_status} {DIM}(plays after {HABITUATION_THRESHOLD} refires){RESET}
   {DIM}captures  {RESET}{capture_count} existing (max {MAX_CAPTURES})
   {DIM}daylight  {RESET}{DAYLIGHT_START.strftime('%H:%M')} – {DAYLIGHT_END.strftime('%H:%M')}
 
@@ -270,6 +287,7 @@ def main() -> None:
     was_motion = False
     target_present = False     # set True after a confirmed crow; clears after N empty YOLO frames
     empty_yolo_count = 0
+    consecutive_refires = 0    # persistent-refires in a row; resets when target leaves
     last_trigger = 0.0
     last_baseline = time.time()
     last_heartbeat = 0.0
@@ -346,6 +364,7 @@ def main() -> None:
                     log(f"⏸ {TARGET_DESCRIPTION} left the frame "
                         f"(after {empty_yolo_count} empty YOLO checks)")
                     target_present = False
+                    consecutive_refires = 0  # reset habituation counter
                 log(f"  → YOLO: no {TARGET_YOLO_CLASS} "
                     f"(top conf={yolo_conf:.2f}, {yolo_ms:.0f}ms)")
                 time.sleep(LOOP_INTERVAL)
@@ -373,9 +392,19 @@ def main() -> None:
             if confirmed:
                 stats["crows"] += 1
                 trigger_kind = "persistent-refire" if target_present else "rising-edge"
+                if trigger_kind == "persistent-refire":
+                    consecutive_refires += 1
                 target_present = True
                 save_capture(frame, TARGET_DESCRIPTION)
-                play_distress(reason=f"{TARGET_DESCRIPTION}, {trigger_kind}")
+
+                if consecutive_refires >= HABITUATION_THRESHOLD:
+                    save_capture(frame, "habituated")
+                    play_alarm(
+                        reason=f"{TARGET_DESCRIPTION} won't leave — "
+                        f"{consecutive_refires} refires in a row"
+                    )
+                else:
+                    play_distress(reason=f"{TARGET_DESCRIPTION}, {trigger_kind}")
                 last_trigger = now
             else:
                 save_capture(frame, f"{TARGET_YOLO_CLASS}_not_{TARGET_DESCRIPTION}")
