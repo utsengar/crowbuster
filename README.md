@@ -257,6 +257,164 @@ On a 2012 ThinkPad (4-core Intel, 4GB RAM, no GPU):
 
 Plenty of headroom for the box to keep doing other things. To squeeze more performance: switch to multi-user boot (`sudo systemctl set-default multi-user.target`) and skip the GUI entirely.
 
+## Troubleshooting
+
+### 🆘 The screen is stuck off and I can't get it back
+
+This is the most common worry. Recovery options, easiest first:
+
+1. **Press any key on the laptop's physical keyboard.** Same as waking from a screensaver. Always works as long as X is alive.
+2. **Remote panic button from another machine on the network:**
+   ```bash
+   ssh utkarsh@192.168.5.33 'DISPLAY=:0 xset dpms force on'
+   ```
+   Aliasing this on your dev machine is recommended:
+   ```bash
+   # Add to ~/.zshrc:
+   alias eva-screen-on='ssh utkarsh@192.168.5.33 "DISPLAY=:0 xset dpms force on"'
+   ```
+3. **Ctrl+C the running script.** The `finally` block fires `xset dpms force on` automatically.
+4. **Kill the script over SSH** — same effect:
+   ```bash
+   pkill -f crowbuster.py
+   ```
+5. **Reboot.** DPMS state doesn't persist across reboots.
+
+To never have the script touch the display:
+```bash
+# Add to .env:
+CROWBUSTER_NO_SCREEN_CONTROL=1
+```
+
+`xset dpms force off` is a runtime X server state — exactly what a screensaver does. It is not persisted, not a system config change, and survives no power cycle. You are never trapped.
+
+### No sound plays when a target is detected
+
+1. Verify mp3s exist:
+   ```bash
+   ls -la ~/crowbuster/sounds/*.mp3
+   ```
+   The shuffle-bag needs at least one. If empty, drop some in.
+
+2. Confirm audio is routed to the Bluetooth speaker (not the laptop speaker):
+   ```bash
+   paplay ~/crowbuster/sounds/<any-file>.mp3
+   ```
+   Should come from the BT speaker. If not, set it as default output:
+   ```bash
+   pactl set-default-sink <bluez_sink_name>
+   pactl list short sinks   # find the right name
+   ```
+
+3. Check the BT connection is alive:
+   ```bash
+   bluetoothctl info <speaker-mac>
+   ```
+
+4. The mpg123 `id3.c:process_comment` error is harmless — the audio plays even when it appears. Strip metadata to silence the warning:
+   ```bash
+   sudo apt install -y eyed3
+   eyeD3 --remove-all sounds/*.mp3
+   ```
+
+### Camera not opening / `FATAL: cannot open camera`
+
+1. Test outside the script:
+   ```bash
+   python3 -c "import cv2; c=cv2.VideoCapture(0); ok,_=c.read(); print(ok); c.release()"
+   ```
+   Should print `True`.
+
+2. If `False`, check the camera isn't held by another process:
+   ```bash
+   fuser /dev/video0   # shows PID using it
+   ```
+
+3. Permission check — your user should be in the `video` group:
+   ```bash
+   groups   # look for "video"
+   sudo usermod -aG video $USER   # add if missing; log out + back in
+   ```
+
+4. Try a different `CAMERA_INDEX` (some laptops list the same camera as both 0 and 1).
+
+### `ANTHROPIC_API_KEY` not set / API errors on every fire
+
+Either the `.env` file isn't being picked up, or the key in it is wrong:
+
+```bash
+cd ~/crowbuster
+cat .env | grep ANTHROPIC   # key should start with sk-ant-
+python3 -c "from dotenv import load_dotenv; load_dotenv(); import os; print('key set:', bool(os.environ.get('ANTHROPIC_API_KEY')))"
+```
+
+If `key set: False`, the file is missing or malformed. Recreate it from `.env.example`.
+
+### False positives: speaker keeps firing on an empty porch
+
+1. Look at the most recent capture to see what triggered it:
+   ```bash
+   ls -lt captures/ | head -5
+   ```
+   Then `scp` it back to look at it. Common culprits: a coat on a chair, a poster of a person, your reflection in a window, the laundry on a line.
+
+2. If YOLO is hallucinating a `bird` on an empty frame, raise its confidence threshold:
+   ```python
+   YOLO_BIRD_CONFIDENCE = 0.40   # was 0.25
+   ```
+
+3. If motion is firing too often (camera shake, lighting changes), raise:
+   ```python
+   MOTION_THRESHOLD = 12.0   # was 8.0
+   ```
+
+### False negatives: real crow visited but no fire happened
+
+1. Check `events.log` for the time window — did motion fire? did YOLO escalate?
+2. If motion didn't fire, lower `MOTION_THRESHOLD`.
+3. If motion fired but YOLO didn't find a bird, lower `YOLO_BIRD_CONFIDENCE`.
+4. If both fired but Claude said no, try upgrading the model:
+   ```python
+   MODEL = "claude-opus-4-7"   # more accurate, ~5× the cost
+   ```
+
+### `NNPACK could not initialize` warnings flood the log
+
+Suppressed by default on newer code (the YOLO call is wrapped in `_silenced_stderr`). If you still see them, you're likely on an older revision — `git pull` to update.
+
+### Disk filling up
+
+- `captures/` is capped at `MAX_CAPTURES` (default 500). Lower it if needed.
+- `events.log` grows ~75 MB/year. Truncate without restarting:
+  ```bash
+  : > ~/crowbuster/events.log
+  ```
+- PyTorch CUDA libs eat ~3 GB on a CPU-only laptop. Reclaim:
+  ```bash
+  source .venv/bin/activate
+  pip uninstall -y torch torchvision nvidia-* triton cuda-*
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+  ```
+
+### The script crashed, how do I see what happened?
+
+```bash
+tail -100 ~/crowbuster/events.log
+```
+
+If the process died without writing the stack trace, you may need to look at stdout where the script was launched, or the cron output file if running via `@reboot`.
+
+### Verifying the script is running (from another machine)
+
+```bash
+ssh utkarsh@192.168.5.33 'cat ~/crowbuster/heartbeat'
+```
+
+The timestamp should be within the last 60 seconds. Stale = script died, restart with:
+```bash
+ssh utkarsh@192.168.5.33 'cd ~/crowbuster && nohup .venv/bin/python crowbuster.py >> events.log 2>&1 &'
+```
+
 ## Credits
 
 - Crow distress audio: [HME Products](https://www.hmeproducts.com/sounds-download/)
