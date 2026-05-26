@@ -317,6 +317,18 @@ If you see crows tagged `bird_not_crow`, the Claude prompt or model needs tuning
 
 The folder caps itself at `MAX_CAPTURES` (default 500) — oldest files are pruned automatically. You'll see `pruned N old captures` in the log when this happens.
 
+**Browse captures from a dev machine in a web browser** — to skim recent frames visually without copying anything locally, run a one-line HTTP server on the run host:
+
+```bash
+ssh <user>@<run-host>
+cd ~/crowbuster/captures
+python3 -m http.server 8000
+```
+
+Then open `http://<run-host>:8000` in any browser on the same network. Click a jpg to view inline; refresh to pick up newly written frames. Ctrl+C the SSH session when done.
+
+> Only run this on a trusted LAN — `http.server` has no authentication.
+
 ### Performance on old hardware
 
 On a 2012 ThinkPad (4-core Intel, 4GB RAM, no GPU):
