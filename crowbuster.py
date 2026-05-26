@@ -76,7 +76,12 @@ CAPTURE_PRUNE_EVERY = 20           # check captures/ folder size every Nth save
 HEARTBEAT_SECONDS = 60             # write heartbeat file every N seconds
 STATS_INTERVAL_SECONDS = 300       # log pipeline stats every N seconds
 
-MOTION_THRESHOLD = 8.0             # mean blurred abs-diff above this = motion
+MOTION_THRESHOLD = 3.5             # mean blurred abs-diff above this = motion
+                                   #   tuned down from 8.0 after prod logs showed
+                                   #   real birds weren't budging the score enough.
+                                   #   Small/distant birds barely shift the mean —
+                                   #   prefer false motion (cheap, just runs YOLO)
+                                   #   over missing a landing (dead eggs).
 YOLO_BIRD_CONFIDENCE = 0.25        # permissive — false positives just cost an API call
 YOLO_FORCE_CHECK_EVERY = 30        # every Nth iteration, run YOLO regardless of motion
                                    #   (catches a crow that lands silently)

@@ -188,7 +188,7 @@ Tweak the constants at the top of `crowbuster.py`:
 | `MAX_PLAY_SECONDS` | `45` | Truncate long audio files; keeps detection loop responsive. |
 | `MAX_CAPTURES` | `500` | Cap on `captures/` folder size (~25–50 MB). Oldest pruned first. |
 | `CAPTURE_PRUNE_EVERY` | `20` | Check folder size every Nth save (avoids per-save filesystem stat). |
-| `MOTION_THRESHOLD` | `8.0` | Lower = more sensitive. Tune by watching `captures/`. |
+| `MOTION_THRESHOLD` | `3.5` | Mean blurred abs-diff cutoff. Lower = more sensitive. Tuned down from `8.0` after a 2-day prod log showed 0 birds detected — small/distant birds barely shift the mean. If empty-porch frames start triggering YOLO too often, raise toward `5–6`; if you still miss landings, drop toward `2.5`. |
 | `YOLO_BIRD_CONFIDENCE` | `0.25` | Permissive on purpose — false positives are cheap. |
 | `YOLO_FORCE_CHECK_EVERY` | `30` | Run YOLO every Nth iteration even without motion (catches silent landings). |
 | `STATS_INTERVAL_SECONDS` | `300` | How often to log pipeline activity summary. |
@@ -463,13 +463,14 @@ If `key set: False`, the file is missing or malformed. Recreate it from `.env.ex
 
 3. If motion is firing too often (camera shake, lighting changes), raise:
    ```python
-   MOTION_THRESHOLD = 12.0   # was 8.0
+   MOTION_THRESHOLD = 6.0   # was 3.5
    ```
+   The default is intentionally permissive — false motion just costs a YOLO call (~140ms, free). Only raise if YOLO is being woken constantly on an empty frame.
 
 ### False negatives: real crow visited but no fire happened
 
 1. Check `events.log` for the time window — did motion fire? did YOLO escalate?
-2. If motion didn't fire, lower `MOTION_THRESHOLD`.
+2. If motion didn't fire, lower `MOTION_THRESHOLD` (try `2.5`, then `2.0`). Default is `3.5`; small or distant birds against a still porch may only nudge the mean diff by 2–3. Even at the default, `YOLO_FORCE_CHECK_EVERY=30` runs YOLO every 30th frame regardless — so a totally silent landing should still get caught within ~30s. If you're seeing `motion=0` for long stretches in the stats line during clearly-active daylight hours, drop the threshold.
 3. If motion fired but YOLO didn't find a bird, lower `YOLO_BIRD_CONFIDENCE`.
 4. If both fired but Claude said no, try upgrading the model:
    ```python
