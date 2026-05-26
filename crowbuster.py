@@ -69,9 +69,7 @@ HABITUATION_THRESHOLD = 2          # consecutive persistent-refires before sound
 # Disable by setting CROWBUSTER_NO_SCREEN_CONTROL=1 (headless boxes, multi-user.target).
 CONTROL_SCREEN = os.environ.get("CROWBUSTER_NO_SCREEN_CONTROL", "0") != "1"
 SCREEN_DISPLAY = os.environ.get("DISPLAY", ":0")
-BASELINE_DETERRENT_MINUTES = 30    # play a sound this often regardless (insurance)
 COOLDOWN = 30                      # min seconds between any speaker triggers
-                                   #   (suppresses baseline right after a real fire)
 MAX_PLAY_SECONDS = 45              # cap sound playback (long files won't stall detection)
 MAX_CAPTURES = 500                 # keep at most this many capture jpgs (~25-50 MB)
 CAPTURE_PRUNE_EVERY = 20           # check captures/ folder size every Nth save
@@ -379,7 +377,6 @@ def main() -> None:
     empty_yolo_count = 0
     consecutive_refires = 0    # persistent-refires in a row; resets when target leaves
     last_trigger = 0.0
-    last_baseline = time.time()
     last_heartbeat = 0.0
     last_stats = time.time()
     iteration = 0
@@ -404,17 +401,6 @@ def main() -> None:
 
             if not is_daylight():
                 time.sleep(LOOP_INTERVAL * 5)  # poll less at night
-                continue
-
-            # Baseline insurance: play a deterrent every ~30min regardless
-            if (
-                now - last_baseline > BASELINE_DETERRENT_MINUTES * 60
-                and now - last_trigger > COOLDOWN
-            ):
-                play_distress(reason="baseline")
-                last_baseline = now
-                last_trigger = now
-                time.sleep(LOOP_INTERVAL)
                 continue
 
             ok, frame = cam.read()
