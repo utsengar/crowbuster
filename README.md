@@ -53,7 +53,6 @@ Add `sounds/alarm.wav` to enable. The script falls back to a regular distress so
 
 ### Safeguards that work even if detection is broken
 
-- **Baseline deterrent** — plays a random distress sound every ~30 minutes regardless of detection. Crows learn the location = noise = bad. Free insurance against the entire pipeline failing.
 - **Heartbeat file** — script writes `./heartbeat` every 60s. If the file goes stale, you know the script died.
 - **Auto camera reopen** — if the camera read fails mid-loop, the script reopens it.
 - **`@reboot` cron** — script auto-restarts on boot.
@@ -184,7 +183,6 @@ Tweak the constants at the top of `crowbuster.py`:
 | `TARGET_GONE_AFTER_N_EMPTY` | `5` | Consecutive YOLO misses before considering the target gone (resets rising-edge). |
 | `PERSISTENT_REFIRE_SECONDS` | `210` | Re-fire if a target stays in frame this long. Stubborn-crow insurance. |
 | `HABITUATION_THRESHOLD` | `2` | Persistent-refires in a row before playing `sounds/alarm.wav` to summon a human. |
-| `BASELINE_DETERRENT_MINUTES` | `30` | Random distress sound every N minutes regardless of detection. |
 | `MAX_PLAY_SECONDS` | `45` | Truncate long audio files; keeps detection loop responsive. |
 | `MAX_CAPTURES` | `500` | Cap on `captures/` folder size (~25–50 MB). Oldest pruned first. |
 | `CAPTURE_PRUNE_EVERY` | `20` | Check folder size every Nth save (avoids per-save filesystem stat). |
