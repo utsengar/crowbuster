@@ -70,6 +70,8 @@ HABITUATION_THRESHOLD = 2          # consecutive persistent-refires before sound
 CONTROL_SCREEN = os.environ.get("CROWBUSTER_NO_SCREEN_CONTROL", "0") != "1"
 SCREEN_DISPLAY = os.environ.get("DISPLAY", ":0")
 BASELINE_DETERRENT_MINUTES = 30    # play a sound this often regardless (insurance)
+COOLDOWN = 30                      # min seconds between any speaker triggers
+                                   #   (suppresses baseline right after a real fire)
 MAX_PLAY_SECONDS = 45              # cap sound playback (long files won't stall detection)
 MAX_CAPTURES = 500                 # keep at most this many capture jpgs (~25-50 MB)
 CAPTURE_PRUNE_EVERY = 20           # check captures/ folder size every Nth save
