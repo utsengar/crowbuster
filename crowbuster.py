@@ -233,24 +233,28 @@ def play_distress(reason: str) -> None:
     _play_file(sound, f"🚨 SPEAKER FIRED ({reason}) — playing {sound.name}")
 
 
-def send_alert(reason: str, frame=None) -> None:
-    """Push a high-priority notification to the configured ntfy topic, with
-    the triggering frame attached as a JPEG. No-op if no topic is configured.
-    Best-effort — a notification failure must never break the detection loop."""
+def send_alert(title: str, message: str, frame=None, priority: str = "default",
+               tag: str = "owl") -> None:
+    """Push a notification to the configured ntfy topic, with the triggering
+    frame attached as a JPEG. No-op if no topic is configured. Best-effort —
+    a notification failure must never break the detection loop.
+
+    Priority: "default" for routine detections (your phone settings decide
+    whether to make sound), "urgent" for HUMAN ALARM (breaks through DND)."""
     if not NTFY_TOPIC:
         return
     headers = {
-        "Title": "crowbuster — HUMAN ALARM",
-        "Priority": "high",
-        "Tags": "rotating_light",
-        "Message": reason,
+        "Title": title,
+        "Priority": priority,
+        "Tags": tag,
+        "Message": message,
     }
     body = b""
     if frame is not None:
         ok, buf = cv2.imencode(".jpg", frame)
         if ok:
             body = buf.tobytes()
-            headers["Filename"] = f"alarm-{int(time.time())}.jpg"
+            headers["Filename"] = f"detect-{int(time.time())}.jpg"
     try:
         req = urllib.request.Request(
             f"{NTFY_SERVER}/{NTFY_TOPIC}",
@@ -260,16 +264,15 @@ def send_alert(reason: str, frame=None) -> None:
         )
         with urllib.request.urlopen(req, timeout=5):
             pass
-        log(f"📲 phone alert sent to ntfy/{NTFY_TOPIC}")
+        log(f"📲 phone alert sent to ntfy/{NTFY_TOPIC} ({priority})")
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         log(f"ntfy alert failed: {e}")
 
 
-def play_alarm(reason: str, frame=None) -> None:
-    """Play the dedicated human-summoning alarm AND push a phone notification.
-    Falls back to a regular distress sound if alarm.wav isn't present yet.
-    Sends the ntfy push first so the phone buzzes before the audio plays."""
-    send_alert(reason, frame)
+def play_alarm(reason: str) -> None:
+    """Play the dedicated human-summoning alarm sound. Falls back to a regular
+    distress sound if alarm.wav isn't present. Phone notification is sent at
+    the call site, not here — see send_alert()."""
     if ALARM_SOUND.exists():
         _play_file(ALARM_SOUND, f"🆘 HUMAN ALARM ({reason}) — playing {ALARM_SOUND.name}")
     else:
@@ -522,12 +525,34 @@ def main() -> None:
                 save_capture(frame, TARGET_DESCRIPTION)
 
                 if consecutive_refires >= HABITUATION_THRESHOLD:
+                    # Stubborn target — louder phone alert, then play the
+                    # human-summoning sound. send_alert fires first so the
+                    # phone buzzes before audio playback blocks the loop.
                     save_capture(frame, "habituated")
+                    send_alert(
+                        title=f"🆘 HUMAN ALARM — {TARGET_DESCRIPTION} won't leave",
+                        message=f"{consecutive_refires} refires in a row. Go outside.",
+                        frame=frame,
+                        priority="urgent",
+                        tag="rotating_light",
+                    )
                     play_alarm(
                         reason=f"{TARGET_DESCRIPTION} won't leave — "
-                        f"{consecutive_refires} refires in a row",
-                        frame=frame,
+                        f"{consecutive_refires} refires in a row"
                     )
+                elif trigger_kind == "rising-edge":
+                    # New arrival — log the catch on your phone (default priority,
+                    # your phone decides whether to play a sound). Persistent-refires
+                    # of the same target intentionally do NOT alert again — you've
+                    # already been told it's there; no need to buzz twice.
+                    send_alert(
+                        title=f"crowbuster — {TARGET_DESCRIPTION} detected",
+                        message=f"YOLO conf {yolo_conf:.2f}, Claude {claude_ms:.0f}ms.",
+                        frame=frame,
+                        priority="default",
+                        tag="owl",
+                    )
+                    play_distress(reason=f"{TARGET_DESCRIPTION}, {trigger_kind}")
                 else:
                     play_distress(reason=f"{TARGET_DESCRIPTION}, {trigger_kind}")
                 last_trigger = now
