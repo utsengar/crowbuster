@@ -147,7 +147,29 @@ exit
 
 Set it as default audio output in your sound settings.
 
-### 6. Test the pipeline end-to-end
+### 6. (Optional) Phone alerts via ntfy.sh
+
+Push a notification to your phone with the triggering frame attached every time the system catches a real predator. Two priorities:
+
+- **Default priority** — fired on every confirmed new detection (rising-edge). Your phone settings decide whether it makes sound.
+- **Urgent priority** — fired on the `🆘 HUMAN ALARM` escalation (target refuses to leave after multiple refires). Loud, breaks through Do Not Disturb on most phones.
+
+Persistent-refires of the *same* target intentionally do NOT re-alert — once you know a crow is on the porch, you don't need 4 more buzzes over the next 10 minutes. New animal = new ping.
+
+1. Pick a hard-to-guess topic name (e.g. `crowbuster-utkarsh-7g3pq`). **Anyone who knows the topic can read your alerts**, so don't pick something obvious.
+2. Install the **ntfy** app — [iOS](https://apps.apple.com/us/app/ntfy/id1625396347), [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy), or just open `ntfy.sh/<your-topic>` in a browser.
+3. Subscribe to your topic in the app.
+4. Set the env var in `.env`:
+
+   ```bash
+   CROWBUSTER_NTFY_TOPIC=crowbuster-utkarsh-7g3pq
+   ```
+
+5. Restart. The startup banner will show `phone  ntfy/<topic> (priority=high)`. If you ever want to silence it, just unset the var — no code change.
+
+Self-hosting ntfy? Set `CROWBUSTER_NTFY_SERVER=https://ntfy.yourdomain.com` too. Free public `ntfy.sh` is fine for personal use.
+
+### 7. Test the pipeline end-to-end
 
 Before pointing it at a real nest, verify each stage works using test mode — it swaps the target from "crow" to "human" so you can stand in front of the camera:
 
@@ -166,7 +188,7 @@ You'll see `crowbuster started [TEST]` in the startup log along with a `targets:
 
 Walk out of frame, wait 5+ seconds, walk back in — speaker should fire again (rising-edge). If it fires while you're stationary, that's the persistent-refire safety kicking in after 3 minutes.
 
-### 7. Run for real
+### 8. Run for real
 
 ```bash
 python3 crowbuster.py
@@ -192,8 +214,10 @@ Tweak the constants at the top of `crowbuster.py`:
 | `MODEL` | `claude-haiku-4-5` | Upgrade to `claude-opus-4-7` if accuracy is poor. |
 | `CAMERA_INDEX` | `0` | Built-in webcam. `1`, `2`, ... for USB cameras. |
 | `DAYLIGHT_START` / `_END` | `5:30` / `20:30` | Window used by targets with `active_hours="daylight"`. Targets with `active_hours="always"` ignore this. |
-| `TEST_MODE` | env var | Set `CROWBUSTER_TEST=1` to swap `TARGETS` to a single `person` entry for end-to-end testing. |
+| `TEST_MODE` | env var | Set `CROWBUSTER_TEST=1` to swap `TARGETS` to a single `person` entry for end-to-end testing. The phone alert fires in test mode too, so you can verify it end-to-end. |
 | `CONTROL_SCREEN` | env var | Set `CROWBUSTER_NO_SCREEN_CONTROL=1` to disable. By default, the script turns the display off at startup, disables the screensaver, and re-asserts the off state every 30s in a background thread (so the screensaver can't wake it). On exit (Ctrl+C, SIGTERM, or crash) the screensaver + DPMS are restored and the screen turned back on. When the script isn't running, the laptop behaves normally. |
+| `CROWBUSTER_NTFY_TOPIC` | env var | Unset = no phone alerts. Set to a hard-to-guess topic name to push a notification (with image) on every confirmed detection. Default priority for new arrivals; urgent priority on HUMAN ALARM. See [step 6](#6-optional-phone-alerts-via-ntfysh). |
+| `CROWBUSTER_NTFY_SERVER` | `https://ntfy.sh` | Override only if self-hosting ntfy. |
 
 Per-target settings (`min_confidence`, `persistent_refire_seconds`, `habituation_threshold`, `use_claude`, `active_hours`, etc.) live inside the `TARGETS` dict at the top of `crowbuster.py` — see [Targets](#targets) below.
 

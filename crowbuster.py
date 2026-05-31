@@ -25,6 +25,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -169,6 +171,16 @@ if TEST_MODE:
         }
     }
 
+# Push notifications via ntfy.sh — fires on every confirmed detection
+# (rising-edge fire = default priority; HUMAN ALARM = urgent priority).
+# Same target lingering = one ping, not many. Leave topic unset to disable.
+#   1. Pick a hard-to-guess topic name (anyone who knows it can read your alerts).
+#   2. Install the "ntfy" app on your phone, subscribe to the topic.
+#   3. Set CROWBUSTER_NTFY_TOPIC=<your-topic> in .env or the environment.
+# Self-hosted: set CROWBUSTER_NTFY_SERVER=https://ntfy.yourdomain.com
+NTFY_TOPIC = os.environ.get("CROWBUSTER_NTFY_TOPIC", "").strip()
+NTFY_SERVER = os.environ.get("CROWBUSTER_NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+
 # --- Setup -----------------------------------------------------------------
 if not os.environ.get("ANTHROPIC_API_KEY"):
     raise SystemExit("Set ANTHROPIC_API_KEY in your environment")
@@ -306,13 +318,50 @@ class TargetState:
 
     def play_alarm(self, reason: str) -> None:
         """Human-summoning alarm. Falls back to this target's distress sounds
-        if alarm.wav isn't present."""
+        if alarm.wav isn't present. Phone notification is sent at the call
+        site, not here — see send_alert()."""
         if ALARM_SOUND.exists():
             _play_file(ALARM_SOUND,
                        f"🆘 HUMAN ALARM ({reason}) — playing {ALARM_SOUND.name}")
         else:
             log(f"alarm sound not found at {ALARM_SOUND.name} — falling back to distress")
             self.play_distress(reason)
+
+
+def send_alert(title: str, message: str, frame=None, priority: str = "default",
+               tag: str = "owl") -> None:
+    """Push a notification to the configured ntfy topic, with the triggering
+    frame attached as a JPEG. No-op if no topic is configured. Best-effort —
+    a notification failure must never break the detection loop.
+
+    Priority: "default" for routine detections (your phone settings decide
+    whether to make sound), "urgent" for HUMAN ALARM (breaks through DND)."""
+    if not NTFY_TOPIC:
+        return
+    headers = {
+        "Title": title,
+        "Priority": priority,
+        "Tags": tag,
+        "Message": message,
+    }
+    body = b""
+    if frame is not None:
+        ok, buf = cv2.imencode(".jpg", frame)
+        if ok:
+            body = buf.tobytes()
+            headers["Filename"] = f"detect-{int(time.time())}.jpg"
+    try:
+        req = urllib.request.Request(
+            f"{NTFY_SERVER}/{NTFY_TOPIC}",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+        log(f"📲 phone alert sent to ntfy/{NTFY_TOPIC} ({priority})")
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        log(f"ntfy alert failed: {e}")
 
 
 _save_count = 0
@@ -410,6 +459,7 @@ def print_banner() -> None:
     mode = f"{YELLOW}TEST MODE{RESET}" if TEST_MODE else f"{CYAN}production{RESET}"
     capture_count = len(list(CAPTURES_DIR.glob("*.jpg")))
     alarm_status = "ready" if ALARM_SOUND.exists() else f"missing ({ALARM_SOUND.name})"
+    phone_status = f"ntfy/{NTFY_TOPIC}" if NTFY_TOPIC else "disabled (set CROWBUSTER_NTFY_TOPIC)"
 
     target_lines = []
     for key, cfg in TARGETS.items():
@@ -432,6 +482,7 @@ def print_banner() -> None:
   {DIM}loop      {RESET}every {LOOP_INTERVAL}s
   {DIM}playback  {RESET}up to {MAX_PLAY_SECONDS}s per sound
   {DIM}alarm     {RESET}{alarm_status}
+  {DIM}phone     {RESET}{phone_status}
   {DIM}captures  {RESET}{capture_count} existing (max {MAX_CAPTURES})
   {DIM}daylight  {RESET}{DAYLIGHT_START.strftime('%H:%M')} – {DAYLIGHT_END.strftime('%H:%M')}
 
@@ -598,11 +649,35 @@ def main() -> None:
                 save_capture(frame, cfg["label"])
 
                 if state.consecutive_refires >= cfg["habituation_threshold"]:
+                    # Stubborn target — louder phone alert, then play the
+                    # human-summoning sound. send_alert fires first so the
+                    # phone buzzes before audio playback blocks the loop.
                     save_capture(frame, "habituated")
+                    send_alert(
+                        title=f"🆘 HUMAN ALARM — {cfg['label']} won't leave",
+                        message=f"{state.consecutive_refires} refires in a row. Go outside.",
+                        frame=frame,
+                        priority="urgent",
+                        tag="rotating_light",
+                    )
                     state.play_alarm(
                         reason=f"{cfg['label']} won't leave — "
                                f"{state.consecutive_refires} refires in a row"
                     )
+                elif trigger_kind == "rising-edge":
+                    # New arrival — log the catch on your phone (default priority,
+                    # your phone decides whether to play a sound). Persistent-refires
+                    # of the same target intentionally do NOT alert again — you've
+                    # already been told it's there; no need to buzz twice.
+                    claude_note = f", Claude {claude_ms:.0f}ms" if cfg["use_claude"] else ""
+                    send_alert(
+                        title=f"crowbuster — {cfg['label']} detected",
+                        message=f"YOLO conf {conf:.2f}{claude_note}.",
+                        frame=frame,
+                        priority="default",
+                        tag="owl",
+                    )
+                    state.play_distress(reason=f"{cfg['label']}, {trigger_kind}")
                 else:
                     state.play_distress(reason=f"{cfg['label']}, {trigger_kind}")
                 state.last_trigger = now
