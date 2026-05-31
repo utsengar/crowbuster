@@ -1,24 +1,25 @@
 # crowbuster
 
-A computer-vision sentry that watches a bird nest, identifies crows in real time, and plays distress calls through a speaker to scare them off.
+A computer-vision sentry that watches a bird nest, identifies predators in real time, and plays distress calls through a speaker to scare them off. Multi-target: crows during the day, cats at night, others wired in via config.
 
 > Built after two consecutive crow attacks wiped out the eggs of a small bird family nesting on our front porch. The third clutch isn't going down without a fight.
 
 ## How it works
 
-A three-stage detection pipeline, cheapest checks first. Each stage is a filter; only frames that pass make it to the next.
+A three-stage detection pipeline, cheapest checks first. Each stage is a filter; only frames that pass make it to the next. The Claude refinement step is per-target and optional — broad YOLO classes (like "bird" → really a crow?) use it, specific ones (like "cat") skip it to save cost.
 
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   Webcam     │──▶│ 1. Motion    │──▶│ 2. YOLOv8n   │──▶│ 3. Claude API   │
-│  every 1s    │    │ (cv2 absdiff)│    │  "is it a    │    │  "is it a       │
-│              │    │  ~5ms, free  │    │   bird?"     │    │   crow?"        │
-│              │    │              │    │ ~140ms, free │    │ ~600ms, paid    │
-└──────────────┘    └──────┬───────┘    └──────┬───────┘    └────────┬────────┘
-                            │ no                │ no                  │ yes
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐
+│   Webcam     │──▶│ 1. Motion    │──▶│ 2. YOLOv8n   │──▶│ 3. Claude (opt)  │
+│  every 1s    │    │ (cv2 absdiff)│    │  "bird?      │    │  "is the bird    │
+│              │    │  ~5ms, free  │    │   cat?       │    │   a crow?"       │
+│              │    │              │    │   dog? ..."  │    │ ~600ms, paid     │
+│              │    │              │    │ ~140ms, free │    │ skipped for cat  │
+└──────────────┘    └──────┬───────┘    └──────┬───────┘    └────────┬─────────┘
+                            │ no                │ no                  │ yes / skipped
                             ▼                   ▼                     ▼
-                          skip                skip          🚨 Play distress
-                                                              call through
+                          skip                skip          🚨 Play target-specific
+                                                              deterrent through
                                                               Bluetooth speaker
 ```
 
@@ -176,18 +177,18 @@ Before pointing it at a real nest, verify each stage works using test mode — i
 CROWBUSTER_TEST=1 python3 crowbuster.py
 ```
 
-You'll see `[TEST_MODE (target=human)]` in the startup log. Step in/out of frame and confirm:
+You'll see `crowbuster started [TEST]` in the startup log along with a `targets:` block listing the swapped-in `person` target. Step in/out of frame and confirm:
 
 | Stage | What you'll see | Proves |
 |---|---|---|
 | Motion | `⏵ motion started (diff=12.4)` | Camera + frame diff working |
-| YOLO | `→ YOLO: person FOUND (conf=0.87, 142ms)` | Local model loaded, person class detected |
-| Claude | `→ Claude: YES (612ms)` | API key + network working |
-| Speaker | `🚨 SPEAKER FIRED (human)` | Bluetooth speaker + audio path working |
+| YOLO | `→ YOLO: person FOUND (human, conf=0.87, 142ms)` | Local model loaded, person class detected |
+| Claude | `→ Claude(human): YES (612ms)` | API key + network working |
+| Speaker | `🚨 SPEAKER FIRED (human, rising-edge)` | Bluetooth speaker + audio path working |
 
 Walk out of frame, wait 5+ seconds, walk back in — speaker should fire again (rising-edge). If it fires while you're stationary, that's the persistent-refire safety kicking in after 3 minutes.
 
-### 7. Run for real
+### 8. Run for real
 
 ```bash
 python3 crowbuster.py
@@ -203,25 +204,67 @@ Tweak the constants at the top of `crowbuster.py`:
 |---|---|---|
 | `LOOP_INTERVAL` | `1` | Seconds between motion checks. Lower = faster reaction, more CPU. |
 | `TARGET_GONE_AFTER_N_EMPTY` | `5` | Consecutive YOLO misses before considering the target gone (resets rising-edge). |
-| `PERSISTENT_REFIRE_SECONDS` | `210` | Re-fire if a target stays in frame this long. Stubborn-crow insurance. |
-| `HABITUATION_THRESHOLD` | `2` | Persistent-refires in a row before playing `sounds/alarm.wav` to summon a human. |
 | `MAX_PLAY_SECONDS` | `45` | Truncate long audio files; keeps detection loop responsive. |
 | `MAX_CAPTURES` | `500` | Cap on `captures/` folder size (~25–50 MB). Oldest pruned first. |
 | `CAPTURE_PRUNE_EVERY` | `20` | Check folder size every Nth save (avoids per-save filesystem stat). |
 | `MOTION_THRESHOLD` | `3.5` | Mean blurred abs-diff cutoff. Lower = more sensitive. Tuned down from `8.0` after a 2-day prod log showed 0 birds detected — small/distant birds barely shift the mean. If empty-porch frames start triggering YOLO too often, raise toward `5–6`; if you still miss landings, drop toward `2.5`. |
-| `YOLO_BIRD_CONFIDENCE` | `0.25` | Permissive on purpose — false positives are cheap. |
 | `YOLO_FORCE_CHECK_EVERY` | `30` | Run YOLO every Nth iteration even without motion (catches silent landings). |
 | `STATS_INTERVAL_SECONDS` | `300` | How often to log pipeline activity summary. |
 | `HEARTBEAT_SECONDS` | `60` | How often to update `./heartbeat`. |
 | `MODEL` | `claude-haiku-4-5` | Upgrade to `claude-opus-4-7` if accuracy is poor. |
 | `CAMERA_INDEX` | `0` | Built-in webcam. `1`, `2`, ... for USB cameras. |
-| `DAYLIGHT_START` / `_END` | `5:30` / `20:30` | Sleep through the night — crows don't hunt then. |
-| `TEST_MODE` | env var | Set `CROWBUSTER_TEST=1` to detect humans for testing. The phone alert fires in test mode too, so you can verify it end-to-end. |
+| `DAYLIGHT_START` / `_END` | `5:30` / `20:30` | Window used by targets with `active_hours="daylight"`. Targets with `active_hours="always"` ignore this. |
+| `TEST_MODE` | env var | Set `CROWBUSTER_TEST=1` to swap `TARGETS` to a single `person` entry for end-to-end testing. The phone alert fires in test mode too, so you can verify it end-to-end. |
 | `CONTROL_SCREEN` | env var | Set `CROWBUSTER_NO_SCREEN_CONTROL=1` to disable. By default, the script turns the display off at startup, disables the screensaver, and re-asserts the off state every 30s in a background thread (so the screensaver can't wake it). On exit (Ctrl+C, SIGTERM, or crash) the screensaver + DPMS are restored and the screen turned back on. When the script isn't running, the laptop behaves normally. |
 | `CROWBUSTER_NTFY_TOPIC` | env var | Unset = no phone alerts. Set to a hard-to-guess topic name to push a notification (with image) on every confirmed detection. Default priority for new arrivals; urgent priority on HUMAN ALARM. See [step 6](#6-optional-phone-alerts-via-ntfysh). |
 | `CROWBUSTER_NTFY_SERVER` | `https://ntfy.sh` | Override only if self-hosting ntfy. |
 
-> **Test-mode timing override:** when `CROWBUSTER_TEST=1`, `PERSISTENT_REFIRE_SECONDS` drops to 10 and `TARGET_GONE_AFTER_N_EMPTY` drops to 3. This makes the full pipeline (rising-edge → persistent-refire → habituated-crow alarm) reachable in ~30 seconds of standing in frame, instead of ~7 minutes. Production timings are unchanged.
+Per-target settings (`min_confidence`, `persistent_refire_seconds`, `habituation_threshold`, `use_claude`, `active_hours`, etc.) live inside the `TARGETS` dict at the top of `crowbuster.py` — see [Targets](#targets) below.
+
+> **Test-mode timing override:** when `CROWBUSTER_TEST=1`, the `TARGETS` dict is replaced with a single `person` entry whose `persistent_refire_seconds` is `10` and `TARGET_GONE_AFTER_N_EMPTY` drops to `3`. The full pipeline (rising-edge → persistent-refire → habituated alarm) becomes reachable in ~30s of standing in frame instead of ~7 minutes. Production timings are unchanged.
+
+## Targets
+
+crowbuster watches for any number of predator classes in parallel. Each entry in the `TARGETS` dict at the top of `crowbuster.py` defines one:
+
+```python
+TARGETS = {
+    "crow": {
+        "yolo_class": "bird",              # COCO class YOLO looks for
+        "label": "crow",                   # appears in logs / capture filenames
+        "min_confidence": 0.25,            # YOLO threshold (0.0–1.0)
+        "sounds_dir": HERE / "sounds",     # folder of *.mp3 deterrents
+        "use_claude": True,                # refine YOLO → "is it really a crow?"
+        "claude_prompt": "Is there a crow…",
+        "active_hours": "daylight",        # "daylight" or "always"
+        "persistent_refire_seconds": 210,
+        "habituation_threshold": 2,
+    },
+    "cat": {
+        "yolo_class": "cat",
+        "label": "cat",
+        "min_confidence": 0.25,
+        "sounds_dir": HERE / "sounds" / "cat",
+        "use_claude": False,               # YOLO "cat" is precise enough — saves API cost
+        "active_hours": "always",          # cats are mostly nocturnal
+        ...
+    },
+}
+```
+
+YOLO runs **once per frame** and routes each detection to the right state machine — adding targets doesn't multiply CPU cost. Each target keeps its own presence/refire/cooldown bookkeeping in a `TargetState` instance.
+
+### Why some targets skip Claude
+
+`use_claude: True` is for cases where YOLO's class is broader than the actual predator. YOLO "bird" includes the resident parents on the nest, so a second-stage Claude call asks the narrower question "is this a crow?" before firing.
+
+YOLO "cat" or "dog" are already specific. A cat on your porch is the threat — no disambiguation needed. Set `use_claude: False` and skip the API call entirely. Adds zero per-detection cost.
+
+### Adding a new target
+
+1. Find the COCO class in `yolo.names` (e.g. `dog=16`, `bear=21`). Common predators: cat, dog, bear, raccoon (not in COCO — would need Claude-only).
+2. Make `sounds/<key>/` and drop deterrent mp3s in.
+3. Add a `TARGETS` entry. Restart the service.
 
 ## Cost
 
