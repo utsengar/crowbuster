@@ -1,9 +1,12 @@
-"""crowbuster — watch the porch, scare crows, save the eggs.
+"""crowbuster — watch the porch, scare predators, save the eggs.
 
 Three-stage detection pipeline (cheapest first):
   1. Motion detection (cv2.absdiff)  — free, ~5ms
-  2. YOLOv8n bird detection (local)  — free, ~80ms
-  3. Claude vision API crow check    — paid, ~500ms
+  2. YOLOv8n class detection (local) — free, ~80ms
+  3. Claude vision refinement (opt)  — paid, ~500ms, only for ambiguous classes
+
+Multi-target: each predator gets a config entry in TARGETS below. YOLO runs
+once per frame and routes detections to per-target state machines.
 
 Design principle: fail toward MORE alarms, not fewer.
 Every stage escalates on uncertainty. Network errors → fire speaker.
@@ -22,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
 from pathlib import Path
 
@@ -62,14 +66,11 @@ ALARM_SOUND = SOUNDS_DIR / "alarm.wav"  # special human-summoning alarm for habi
 
 LOOP_INTERVAL = 1                  # seconds between motion checks
 TARGET_GONE_AFTER_N_EMPTY = 5      # consecutive YOLO misses before "target left"
-PERSISTENT_REFIRE_SECONDS = 210    # re-fire if target stays in frame this long (stubborn crow)
-HABITUATION_THRESHOLD = 2          # consecutive persistent-refires before sounding human alarm
 
 # Turn the display off while crowbuster is running, back on when it exits.
 # Disable by setting CROWBUSTER_NO_SCREEN_CONTROL=1 (headless boxes, multi-user.target).
 CONTROL_SCREEN = os.environ.get("CROWBUSTER_NO_SCREEN_CONTROL", "0") != "1"
 SCREEN_DISPLAY = os.environ.get("DISPLAY", ":0")
-COOLDOWN = 30                      # min seconds between any speaker triggers
 MAX_PLAY_SECONDS = 45              # cap sound playback (long files won't stall detection)
 MAX_CAPTURES = 500                 # keep at most this many capture jpgs (~25-50 MB)
 CAPTURE_PRUNE_EVERY = 20           # check captures/ folder size every Nth save
@@ -82,34 +83,91 @@ MOTION_THRESHOLD = 3.5             # mean blurred abs-diff above this = motion
                                    #   Small/distant birds barely shift the mean —
                                    #   prefer false motion (cheap, just runs YOLO)
                                    #   over missing a landing (dead eggs).
-YOLO_BIRD_CONFIDENCE = 0.25        # permissive — false positives just cost an API call
 YOLO_FORCE_CHECK_EVERY = 30        # every Nth iteration, run YOLO regardless of motion
-                                   #   (catches a crow that lands silently)
+                                   #   (catches a target that lands silently)
 
 MODEL = "claude-haiku-4-5"
 CAMERA_INDEX = 0
 
-# Test mode — detect humans instead of crows so you can stand in front of the
-# camera and verify the full pipeline works. Enable with: CROWBUSTER_TEST=1
-# In test mode we shorten the refire/empty thresholds so the persistent-refire
-# and habituation alarm paths are reachable in ~30 seconds of standing in frame.
-TEST_MODE = os.environ.get("CROWBUSTER_TEST", "0") == "1"
-if TEST_MODE:
-    PERSISTENT_REFIRE_SECONDS = 10
-    TARGET_GONE_AFTER_N_EMPTY = 3
-TARGET_YOLO_CLASS = "person" if TEST_MODE else "bird"
-TARGET_DESCRIPTION = "human" if TEST_MODE else "crow"
-TARGET_PROMPT = (
-    "Is there a human (person) visible in this image? "
-    "Reply with only YES or NO."
-    if TEST_MODE
-    else "Is there a crow, raven, or other large dark corvid bird in this "
-    "image? If uncertain, answer YES. Reply with only YES or NO."
-)
-
-# Crows are diurnal — skip nighttime to save cost
+# Daylight window — used by targets with active_hours="daylight"
 DAYLIGHT_START = dtime(5, 30)
 DAYLIGHT_END = dtime(20, 30)
+
+# --- Targets ----------------------------------------------------------------
+# One entry per predator. To add a new animal:
+#   1. Pick a YOLO class from yolo.names (run the model + print names — common
+#      ones: bird=14, cat=15, dog=16, bear=21).
+#   2. Drop deterrent mp3s into sounds/<key>/ (or keep at sounds/ for crow).
+#   3. Add a dict entry below. Restart the service.
+#
+# Each target runs an independent state machine: motion → YOLO → optional
+# Claude → fire. They share one camera and one YOLO inference per frame.
+#
+# Fields:
+#   yolo_class                 — what YOLO calls it
+#   label                      — display name in logs / capture filenames
+#   min_confidence             — YOLO confidence threshold (0.0–1.0)
+#   sounds_dir                 — directory of *.mp3 deterrents (shuffle deck)
+#   use_claude                 — run Claude vision to refine YOLO? Only useful
+#                                when the YOLO class is broader than the actual
+#                                target (e.g. bird→crow). For specific classes
+#                                like cat/dog, set False — saves API cost.
+#   claude_prompt              — required if use_claude=True
+#   active_hours               — "daylight" (5:30–20:30) or "always" (24/7)
+#   persistent_refire_seconds  — re-fire if target lingers this long
+#   habituation_threshold      — consecutive refires before HUMAN ALARM
+TARGETS: dict[str, dict] = {
+    "crow": {
+        "yolo_class": "bird",
+        "label": "crow",
+        "min_confidence": 0.25,
+        "sounds_dir": HERE / "sounds",      # flat layout — existing crow mp3s
+        "use_claude": True,                 # YOLO "bird" includes the resident
+                                            # parents; Claude refines to corvid
+        "claude_prompt": (
+            "Is there a crow, raven, or other large dark corvid bird in this "
+            "image? If uncertain, answer YES. Reply with only YES or NO."
+        ),
+        "active_hours": "daylight",
+        "persistent_refire_seconds": 210,
+        "habituation_threshold": 2,
+    },
+    "cat": {
+        "yolo_class": "cat",
+        "label": "cat",
+        "min_confidence": 0.25,
+        "sounds_dir": HERE / "sounds" / "cat",
+        "use_claude": False,                # YOLO "cat" is specific enough
+        "claude_prompt": None,
+        "active_hours": "always",           # cats come at midnight
+        "persistent_refire_seconds": 210,
+        "habituation_threshold": 2,
+    },
+}
+
+# Test mode — replace TARGETS with a single "person" target so you can stand
+# in front of the camera and verify the full pipeline (including Claude).
+# Refire/empty thresholds are tightened so habituation alarm is reachable in
+# ~30 seconds of standing in frame.
+TEST_MODE = os.environ.get("CROWBUSTER_TEST", "0") == "1"
+if TEST_MODE:
+    TARGET_GONE_AFTER_N_EMPTY = 3
+    TARGETS = {
+        "person": {
+            "yolo_class": "person",
+            "label": "human",
+            "min_confidence": 0.25,
+            "sounds_dir": HERE / "sounds",
+            "use_claude": True,
+            "claude_prompt": (
+                "Is there a human (person) visible in this image? "
+                "Reply with only YES or NO."
+            ),
+            "active_hours": "always",
+            "persistent_refire_seconds": 10,
+            "habituation_threshold": 2,
+        }
+    }
 
 # --- Setup -----------------------------------------------------------------
 if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -143,22 +201,27 @@ def has_motion(prev, curr) -> tuple[bool, float]:
     return diff > MOTION_THRESHOLD, diff
 
 
-def detect_bird(frame) -> tuple[bool, float]:
-    """Stage 2: local YOLO. Returns (found, best_confidence) for the target class."""
+def detect_targets(frame) -> dict[str, float]:
+    """Stage 2: local YOLO, multi-class. Returns {target_key: best_confidence}
+    for every configured TARGET whose yolo_class shows up above its threshold.
+    One inference pass — costs the same whether we have 1 or 5 targets."""
     with _silenced_stderr():
         results = yolo(frame, verbose=False)
-    max_conf = 0.0
+    found: dict[str, float] = {}
     for r in results:
         for box in r.boxes:
-            if yolo.names[int(box.cls)] == TARGET_YOLO_CLASS:
-                conf = float(box.conf)
-                if conf > max_conf:
-                    max_conf = conf
-    return max_conf >= YOLO_BIRD_CONFIDENCE, max_conf
+            cls_name = yolo.names[int(box.cls)]
+            conf = float(box.conf)
+            for key, cfg in TARGETS.items():
+                if cls_name == cfg["yolo_class"] and conf >= cfg["min_confidence"]:
+                    if conf > found.get(key, 0.0):
+                        found[key] = conf
+    return found
 
 
-def is_crow(frame) -> bool:
-    """Stage 3: Claude vision API — fails toward True (alarm)."""
+def is_target_via_claude(frame, prompt: str) -> bool:
+    """Stage 3 (optional, per-target): Claude vision refinement.
+    Fails toward True (alarm) on any error."""
     _, buf = cv2.imencode(".jpg", frame)
     image_b64 = base64.b64encode(buf).decode("utf-8")
     try:
@@ -177,7 +240,7 @@ def is_crow(frame) -> bool:
                                 "data": image_b64,
                             },
                         },
-                        {"type": "text", "text": TARGET_PROMPT},
+                        {"type": "text", "text": prompt},
                     ],
                 }
             ],
@@ -190,9 +253,6 @@ def is_crow(frame) -> bool:
     except anthropic.APIError as e:
         log(f"Claude API error: {e} — failing toward alarm")
         return True
-
-
-_sound_deck: list[Path] = []  # shuffle-bag — cycles through all sounds before repeating
 
 
 def _play_file(path: Path, log_line: str) -> None:
@@ -208,27 +268,51 @@ def _play_file(path: Path, log_line: str) -> None:
         time.sleep(0.1)
 
 
-def play_distress(reason: str) -> None:
-    global _sound_deck
-    if not _sound_deck:
-        sounds = sorted(SOUNDS_DIR.glob("*.mp3"))
-        if not sounds:
-            log(f"No mp3 files in {SOUNDS_DIR} — cannot play deterrent")
-            return
-        _sound_deck = sounds.copy()
-        random.shuffle(_sound_deck)
-    sound = _sound_deck.pop()
-    _play_file(sound, f"🚨 SPEAKER FIRED ({reason}) — playing {sound.name}")
+@dataclass
+class TargetState:
+    """Per-target runtime state. One instance per entry in TARGETS.
+    Owns its own shuffle-deck of deterrent sounds so multiple targets don't
+    fight over a shared deck."""
+    key: str
+    cfg: dict
+    target_present: bool = False
+    empty_yolo_count: int = 0
+    consecutive_refires: int = 0
+    last_trigger: float = 0.0
+    sound_deck: list[Path] = field(default_factory=list)
+    _missing_sounds_warned: bool = False
 
+    def is_active_now(self) -> bool:
+        if self.cfg["active_hours"] == "always":
+            return True
+        return is_daylight()
 
-def play_alarm(reason: str) -> None:
-    """Play the dedicated human-summoning alarm. Falls back to a regular distress
-    sound if alarm.wav isn't present yet."""
-    if ALARM_SOUND.exists():
-        _play_file(ALARM_SOUND, f"🆘 HUMAN ALARM ({reason}) — playing {ALARM_SOUND.name}")
-    else:
-        log(f"alarm sound not found at {ALARM_SOUND.name} — falling back to distress")
-        play_distress(reason)
+    def play_distress(self, reason: str) -> None:
+        if not self.sound_deck:
+            sounds = sorted(self.cfg["sounds_dir"].glob("*.mp3"))
+            if not sounds:
+                # Log once per "empty deck" event — re-checks every cycle so
+                # files dropped in mid-run get picked up automatically.
+                if not self._missing_sounds_warned:
+                    log(f"no mp3 files in {self.cfg['sounds_dir']} — "
+                        f"cannot fire {self.cfg['label']} deterrent")
+                    self._missing_sounds_warned = True
+                return
+            self.sound_deck = sounds.copy()
+            random.shuffle(self.sound_deck)
+            self._missing_sounds_warned = False
+        sound = self.sound_deck.pop()
+        _play_file(sound, f"🚨 SPEAKER FIRED ({reason}) — playing {sound.name}")
+
+    def play_alarm(self, reason: str) -> None:
+        """Human-summoning alarm. Falls back to this target's distress sounds
+        if alarm.wav isn't present."""
+        if ALARM_SOUND.exists():
+            _play_file(ALARM_SOUND,
+                       f"🆘 HUMAN ALARM ({reason}) — playing {ALARM_SOUND.name}")
+        else:
+            log(f"alarm sound not found at {ALARM_SOUND.name} — falling back to distress")
+            self.play_distress(reason)
 
 
 _save_count = 0
@@ -323,14 +407,21 @@ def screen_on() -> None:
 def print_banner() -> None:
     """A friendly startup banner so you know exactly what's loaded."""
     BOLD, DIM, CYAN, YELLOW, RESET = "\033[1m", "\033[2m", "\033[36m", "\033[33m", "\033[0m"
-    mode = (
-        f"{YELLOW}TEST MODE{RESET} {DIM}(target=human){RESET}"
-        if TEST_MODE
-        else f"{CYAN}production{RESET} {DIM}(target=crow){RESET}"
-    )
-    sound_count = len(list(SOUNDS_DIR.glob("*.mp3")))
+    mode = f"{YELLOW}TEST MODE{RESET}" if TEST_MODE else f"{CYAN}production{RESET}"
     capture_count = len(list(CAPTURES_DIR.glob("*.jpg")))
     alarm_status = "ready" if ALARM_SOUND.exists() else f"missing ({ALARM_SOUND.name})"
+
+    target_lines = []
+    for key, cfg in TARGETS.items():
+        sdir = cfg["sounds_dir"]
+        sound_count = len(list(sdir.glob("*.mp3"))) if sdir.exists() else 0
+        claude_note = "Claude-refined" if cfg["use_claude"] else "YOLO-only"
+        target_lines.append(
+            f"  {DIM}· {RESET}{BOLD}{key}{RESET} "
+            f"{DIM}— yolo={cfg['yolo_class']}, {cfg['active_hours']}, "
+            f"{claude_note}, {sound_count} sound{'s' if sound_count != 1 else ''}, "
+            f"refire {cfg['persistent_refire_seconds']}s{RESET}"
+        )
 
     print(f"""
   {CYAN}▸{RESET} {BOLD}crowbuster{RESET} {DIM}— operation eggsafe{RESET}
@@ -339,12 +430,13 @@ def print_banner() -> None:
   {DIM}mode      {RESET}{mode}
   {DIM}model     {RESET}{MODEL}
   {DIM}loop      {RESET}every {LOOP_INTERVAL}s
-  {DIM}refire    {RESET}after {PERSISTENT_REFIRE_SECONDS}s if target persists
   {DIM}playback  {RESET}up to {MAX_PLAY_SECONDS}s per sound
-  {DIM}sounds    {RESET}{sound_count} mp3 file{'s' if sound_count != 1 else ''} loaded
-  {DIM}alarm     {RESET}{alarm_status} {DIM}(plays after {HABITUATION_THRESHOLD} refires){RESET}
+  {DIM}alarm     {RESET}{alarm_status}
   {DIM}captures  {RESET}{capture_count} existing (max {MAX_CAPTURES})
   {DIM}daylight  {RESET}{DAYLIGHT_START.strftime('%H:%M')} – {DAYLIGHT_END.strftime('%H:%M')}
+
+  {DIM}targets:{RESET}
+{chr(10).join(target_lines)}
 
   {CYAN}▸{RESET} {DIM}pipeline starting{RESET}
 """)
@@ -368,19 +460,23 @@ def main() -> None:
         screen_on()
         return
 
-    # Prime prev_frame so the first iteration computes a real diff (no fake "motion started 0.0")
+    # Per-target state machines — independent presence/refire/cooldown bookkeeping
+    states: dict[str, TargetState] = {
+        key: TargetState(key=key, cfg=cfg) for key, cfg in TARGETS.items()
+    }
+
+    # Prime prev_frame so the first iteration computes a real diff
     ok, prev_frame = cam.read()
     if not ok:
         prev_frame = None
     was_motion = False
-    target_present = False     # set True after a confirmed crow; clears after N empty YOLO frames
-    empty_yolo_count = 0
-    consecutive_refires = 0    # persistent-refires in a row; resets when target leaves
-    last_trigger = 0.0
     last_heartbeat = 0.0
     last_stats = time.time()
     iteration = 0
-    stats = {"frames": 0, "motion": 0, "yolo_runs": 0, "birds": 0, "crows": 0}
+    stats: dict[str, int] = {"frames": 0, "motion": 0, "yolo_runs": 0}
+    for key in TARGETS:
+        stats[f"{key}_found"] = 0
+        stats[f"{key}_fired"] = 0
 
     try:
         while True:
@@ -392,15 +488,21 @@ def main() -> None:
                 last_heartbeat = now
 
             if now - last_stats > STATS_INTERVAL_SECONDS:
-                log(
-                    f"stats: frames={stats['frames']} motion={stats['motion']} "
-                    f"yolo={stats['yolo_runs']} birds={stats['birds']} "
-                    f"crows={stats['crows']}"
-                )
+                parts = [
+                    f"frames={stats['frames']}",
+                    f"motion={stats['motion']}",
+                    f"yolo={stats['yolo_runs']}",
+                ]
+                for key in TARGETS:
+                    parts.append(f"{key}_found={stats[f'{key}_found']}")
+                    parts.append(f"{key}_fired={stats[f'{key}_fired']}")
+                log("stats: " + " ".join(parts))
                 last_stats = now
 
-            if not is_daylight():
-                time.sleep(LOOP_INTERVAL * 5)  # poll less at night
+            # Skip the loop entirely only if NO target is active right now.
+            # With "always" targets (e.g. cat), this rarely fires.
+            if not any(s.is_active_now() for s in states.values()):
+                time.sleep(LOOP_INTERVAL * 5)
                 continue
 
             ok, frame = cam.read()
@@ -412,7 +514,7 @@ def main() -> None:
                 continue
             stats["frames"] += 1
 
-            # Stage 1: motion — log every transition so you see it immediately
+            # Stage 1: motion — shared across all targets
             motion, diff = has_motion(prev_frame, frame)
             forced = iteration % YOLO_FORCE_CHECK_EVERY == 0
             prev_frame = frame
@@ -428,62 +530,82 @@ def main() -> None:
                 time.sleep(LOOP_INTERVAL)
                 continue
 
-            # Stage 2: YOLO — log every run with timing + confidence
+            # Stage 2: YOLO — single inference, multi-class routing
             stats["yolo_runs"] += 1
             t0 = time.time()
-            yolo_found, yolo_conf = detect_bird(frame)
+            yolo_results = detect_targets(frame)  # {key: best_conf}
             yolo_ms = (time.time() - t0) * 1000
 
-            if not yolo_found:
-                empty_yolo_count += 1
-                if target_present and empty_yolo_count >= TARGET_GONE_AFTER_N_EMPTY:
-                    log(f"⏸ {TARGET_DESCRIPTION} left the frame "
-                        f"(after {empty_yolo_count} empty YOLO checks)")
-                    target_present = False
-                    consecutive_refires = 0  # reset habituation counter
-                log(f"  → YOLO: no {TARGET_YOLO_CLASS} "
-                    f"(top conf={yolo_conf:.2f}, {yolo_ms:.0f}ms)")
-                time.sleep(LOOP_INTERVAL)
-                continue
+            if not yolo_results:
+                log(f"  → YOLO: no target classes ({yolo_ms:.0f}ms)")
 
-            empty_yolo_count = 0
-            stats["birds"] += 1
-            log(f"  → YOLO: {TARGET_YOLO_CLASS} FOUND "
-                f"(conf={yolo_conf:.2f}, {yolo_ms:.0f}ms)")
+            # Per-target processing — every configured target gets a turn,
+            # whether or not YOLO found its class this frame.
+            for key, cfg in TARGETS.items():
+                state = states[key]
 
-            # Rising-edge gate: only call Claude + fire speaker on new appearance
-            # (or if target has persisted past PERSISTENT_REFIRE_SECONDS)
-            if target_present and now - last_trigger < PERSISTENT_REFIRE_SECONDS:
-                log(f"  → {TARGET_DESCRIPTION} still in frame — not re-firing")
-                time.sleep(LOOP_INTERVAL)
-                continue
+                # Outside this target's active hours → clear any stale presence
+                # so we don't fire stale persistent-refires when it reactivates.
+                if not state.is_active_now():
+                    if state.target_present:
+                        log(f"⏸ {cfg['label']} window closed — clearing state")
+                        state.target_present = False
+                        state.consecutive_refires = 0
+                        state.empty_yolo_count = 0
+                    continue
 
-            # Stage 3: Claude — log timing and verdict
-            t0 = time.time()
-            confirmed = is_crow(frame)
-            claude_ms = (time.time() - t0) * 1000
-            log(f"  → Claude: {'YES' if confirmed else 'no'} "
-                f"({claude_ms:.0f}ms)")
+                conf = yolo_results.get(key, 0.0)
+                if conf == 0.0:
+                    # Not detected this frame
+                    state.empty_yolo_count += 1
+                    if (state.target_present
+                            and state.empty_yolo_count >= TARGET_GONE_AFTER_N_EMPTY):
+                        log(f"⏸ {cfg['label']} left the frame "
+                            f"(after {state.empty_yolo_count} empty YOLO checks)")
+                        state.target_present = False
+                        state.consecutive_refires = 0
+                    continue
 
-            if confirmed:
-                stats["crows"] += 1
-                trigger_kind = "persistent-refire" if target_present else "rising-edge"
+                # Detected this frame
+                state.empty_yolo_count = 0
+                stats[f"{key}_found"] += 1
+                log(f"  → YOLO: {cfg['yolo_class']} FOUND "
+                    f"({cfg['label']}, conf={conf:.2f}, {yolo_ms:.0f}ms)")
+
+                # Rising-edge gate
+                if (state.target_present
+                        and now - state.last_trigger < cfg["persistent_refire_seconds"]):
+                    log(f"  → {cfg['label']} still in frame — not re-firing")
+                    continue
+
+                # Stage 3: optional Claude refinement
+                if cfg["use_claude"]:
+                    t0 = time.time()
+                    confirmed = is_target_via_claude(frame, cfg["claude_prompt"])
+                    claude_ms = (time.time() - t0) * 1000
+                    log(f"  → Claude({cfg['label']}): "
+                        f"{'YES' if confirmed else 'no'} ({claude_ms:.0f}ms)")
+                    if not confirmed:
+                        save_capture(frame, f"{cfg['yolo_class']}_not_{cfg['label']}")
+                        continue
+
+                # Fire
+                trigger_kind = "persistent-refire" if state.target_present else "rising-edge"
                 if trigger_kind == "persistent-refire":
-                    consecutive_refires += 1
-                target_present = True
-                save_capture(frame, TARGET_DESCRIPTION)
+                    state.consecutive_refires += 1
+                state.target_present = True
+                stats[f"{key}_fired"] += 1
+                save_capture(frame, cfg["label"])
 
-                if consecutive_refires >= HABITUATION_THRESHOLD:
+                if state.consecutive_refires >= cfg["habituation_threshold"]:
                     save_capture(frame, "habituated")
-                    play_alarm(
-                        reason=f"{TARGET_DESCRIPTION} won't leave — "
-                        f"{consecutive_refires} refires in a row"
+                    state.play_alarm(
+                        reason=f"{cfg['label']} won't leave — "
+                               f"{state.consecutive_refires} refires in a row"
                     )
                 else:
-                    play_distress(reason=f"{TARGET_DESCRIPTION}, {trigger_kind}")
-                last_trigger = now
-            else:
-                save_capture(frame, f"{TARGET_YOLO_CLASS}_not_{TARGET_DESCRIPTION}")
+                    state.play_distress(reason=f"{cfg['label']}, {trigger_kind}")
+                state.last_trigger = now
 
             time.sleep(LOOP_INTERVAL)
 
