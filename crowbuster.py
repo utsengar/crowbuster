@@ -204,10 +204,19 @@ yolo = YOLO("yolov8n.pt")          # downloads ~6MB on first run
 
 
 def log(msg: str) -> None:
+    """Best-effort logging. NEVER raises — logging is sugar, not a
+    requirement, and the detection loop must survive a broken stdout
+    (e.g. user piped through `head`), full disk, or unwritable log file."""
     line = f"[{datetime.now().isoformat(timespec='seconds')}] {msg}"
-    print(line, flush=True)
-    with LOG_FILE.open("a") as f:
-        f.write(line + "\n")
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass  # stdout closed (pipe died) or write failed — keep going
+    try:
+        with LOG_FILE.open("a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass  # disk full, perms, etc — keep going
 
 
 def is_daylight() -> bool:
@@ -623,184 +632,200 @@ def main() -> None:
 
     try:
         while True:
-            iteration += 1
-            now = time.time()
+            # Per-iteration safety net: ANY unexpected exception inside the
+            # detection body gets logged and we keep going. The whole point
+            # of crowbuster is to be running when a predator shows up — a
+            # transient bug must NEVER take the process down.
+            #
+            # KeyboardInterrupt is re-raised so Ctrl+C / SIGTERM still produce
+            # a clean shutdown via the outer handler.
+            try:
+                iteration += 1
+                now = time.time()
 
-            if now - last_heartbeat > HEARTBEAT_SECONDS:
-                write_heartbeat()
-                last_heartbeat = now
+                if now - last_heartbeat > HEARTBEAT_SECONDS:
+                    write_heartbeat()
+                    last_heartbeat = now
 
-            # Periodic "alive" ping to ntfy. Default 12h. Absence is the signal —
-            # if you stop seeing these for >24h, the system died and you need
-            # to investigate physically (the script can't alert when the box is
-            # offline; this is the only reliable indicator of that case).
-            if now - last_heartbeat_ping > HEARTBEAT_PING_HOURS * 3600:
-                send_heartbeat_ping(stats, now - start_time)
-                last_heartbeat_ping = now
+                # Periodic "alive" ping to ntfy. Default 12h. Absence is the signal —
+                # if you stop seeing these for >24h, the system died and you need
+                # to investigate physically (the script can't alert when the box is
+                # offline; this is the only reliable indicator of that case).
+                if now - last_heartbeat_ping > HEARTBEAT_PING_HOURS * 3600:
+                    send_heartbeat_ping(stats, now - start_time)
+                    last_heartbeat_ping = now
 
-            if now - last_stats > STATS_INTERVAL_SECONDS:
-                parts = [
-                    f"frames={stats['frames']}",
-                    f"motion={stats['motion']}",
-                    f"yolo={stats['yolo_runs']}",
-                ]
-                for key in TARGETS:
-                    parts.append(f"{key}_found={stats[f'{key}_found']}")
-                    parts.append(f"{key}_fired={stats[f'{key}_fired']}")
-                log("stats: " + " ".join(parts))
-                last_stats = now
+                if now - last_stats > STATS_INTERVAL_SECONDS:
+                    parts = [
+                        f"frames={stats['frames']}",
+                        f"motion={stats['motion']}",
+                        f"yolo={stats['yolo_runs']}",
+                    ]
+                    for key in TARGETS:
+                        parts.append(f"{key}_found={stats[f'{key}_found']}")
+                        parts.append(f"{key}_fired={stats[f'{key}_fired']}")
+                    log("stats: " + " ".join(parts))
+                    last_stats = now
 
-            # Skip the loop entirely only if NO target is active right now.
-            # With "always" targets (e.g. cat), this rarely fires.
-            if not any(s.is_active_now() for s in states.values()):
-                time.sleep(LOOP_INTERVAL * 5)
-                continue
-
-            ok, frame = cam.read()
-            if not ok:
-                consecutive_camera_failures += 1
-                log(f"camera read failed (#{consecutive_camera_failures}); reopening")
-                if (consecutive_camera_failures >= CAMERA_FAILURE_ALERT_AFTER
-                        and not camera_alert_sent):
-                    send_camera_failure_alert(consecutive_camera_failures)
-                    camera_alert_sent = True
-                cam.release()
-                time.sleep(2)
-                cam = cv2.VideoCapture(CAMERA_INDEX)
-                continue
-            # Camera back — reset the alert latch so a future outage notifies again
-            if consecutive_camera_failures > 0:
-                log(f"camera recovered after {consecutive_camera_failures} failures")
-                consecutive_camera_failures = 0
-                camera_alert_sent = False
-            stats["frames"] += 1
-
-            # Stage 1: motion — shared across all targets
-            motion, diff = has_motion(prev_frame, frame)
-            forced = iteration % YOLO_FORCE_CHECK_EVERY == 0
-            prev_frame = frame
-            if motion:
-                stats["motion"] += 1
-                if not was_motion:
-                    log(f"⏵ motion started (diff={diff:.1f})")
-            elif was_motion:
-                log(f"⏸ motion stopped (diff={diff:.1f})")
-            was_motion = motion
-
-            if not motion and not forced:
-                time.sleep(LOOP_INTERVAL)
-                continue
-
-            # Stage 2: YOLO — single inference, multi-class routing
-            stats["yolo_runs"] += 1
-            t0 = time.time()
-            yolo_results = detect_targets(frame)  # {key: best_conf}
-            yolo_ms = (time.time() - t0) * 1000
-
-            if not yolo_results:
-                log(f"  → YOLO: no target classes ({yolo_ms:.0f}ms)")
-
-            # Per-target processing — every configured target gets a turn,
-            # whether or not YOLO found its class this frame.
-            for key, cfg in TARGETS.items():
-                state = states[key]
-
-                # Outside this target's active hours → clear any stale presence
-                # so we don't fire stale persistent-refires when it reactivates.
-                if not state.is_active_now():
-                    if state.target_present:
-                        log(f"⏸ {cfg['label']} window closed — clearing state")
-                        state.target_present = False
-                        state.consecutive_refires = 0
-                        state.empty_yolo_count = 0
+                # Skip the loop entirely only if NO target is active right now.
+                # With "always" targets (e.g. cat), this rarely fires.
+                if not any(s.is_active_now() for s in states.values()):
+                    time.sleep(LOOP_INTERVAL * 5)
                     continue
 
-                conf = yolo_results.get(key, 0.0)
-                if conf == 0.0:
-                    # Not detected this frame
-                    state.empty_yolo_count += 1
-                    if (state.target_present
-                            and state.empty_yolo_count >= TARGET_GONE_AFTER_N_EMPTY):
-                        log(f"⏸ {cfg['label']} left the frame "
-                            f"(after {state.empty_yolo_count} empty YOLO checks)")
-                        state.target_present = False
-                        state.consecutive_refires = 0
+                ok, frame = cam.read()
+                if not ok:
+                    consecutive_camera_failures += 1
+                    log(f"camera read failed (#{consecutive_camera_failures}); reopening")
+                    if (consecutive_camera_failures >= CAMERA_FAILURE_ALERT_AFTER
+                            and not camera_alert_sent):
+                        send_camera_failure_alert(consecutive_camera_failures)
+                        camera_alert_sent = True
+                    cam.release()
+                    time.sleep(2)
+                    cam = cv2.VideoCapture(CAMERA_INDEX)
+                    continue
+                # Camera back — reset the alert latch so a future outage notifies again
+                if consecutive_camera_failures > 0:
+                    log(f"camera recovered after {consecutive_camera_failures} failures")
+                    consecutive_camera_failures = 0
+                    camera_alert_sent = False
+                stats["frames"] += 1
+
+                # Stage 1: motion — shared across all targets
+                motion, diff = has_motion(prev_frame, frame)
+                forced = iteration % YOLO_FORCE_CHECK_EVERY == 0
+                prev_frame = frame
+                if motion:
+                    stats["motion"] += 1
+                    if not was_motion:
+                        log(f"⏵ motion started (diff={diff:.1f})")
+                elif was_motion:
+                    log(f"⏸ motion stopped (diff={diff:.1f})")
+                was_motion = motion
+
+                if not motion and not forced:
+                    time.sleep(LOOP_INTERVAL)
                     continue
 
-                # Detected this frame
-                state.empty_yolo_count = 0
-                stats[f"{key}_found"] += 1
-                log(f"  → YOLO: {cfg['yolo_class']} FOUND "
-                    f"({cfg['label']}, conf={conf:.2f}, {yolo_ms:.0f}ms)")
+                # Stage 2: YOLO — single inference, multi-class routing
+                stats["yolo_runs"] += 1
+                t0 = time.time()
+                yolo_results = detect_targets(frame)  # {key: best_conf}
+                yolo_ms = (time.time() - t0) * 1000
 
-                # Rising-edge gate
-                if (state.target_present
-                        and now - state.last_trigger < cfg["persistent_refire_seconds"]):
-                    log(f"  → {cfg['label']} still in frame — not re-firing")
-                    continue
+                if not yolo_results:
+                    log(f"  → YOLO: no target classes ({yolo_ms:.0f}ms)")
 
-                # Stage 3: optional Claude refinement
-                if cfg["use_claude"]:
-                    t0 = time.time()
-                    confirmed = is_target_via_claude(frame, cfg["claude_prompt"])
-                    claude_ms = (time.time() - t0) * 1000
-                    log(f"  → Claude({cfg['label']}): "
-                        f"{'YES' if confirmed else 'no'} ({claude_ms:.0f}ms)")
-                    if not confirmed:
-                        save_capture(frame, f"{cfg['yolo_class']}_not_{cfg['label']}")
+                # Per-target processing — every configured target gets a turn,
+                # whether or not YOLO found its class this frame.
+                for key, cfg in TARGETS.items():
+                    state = states[key]
+
+                    # Outside this target's active hours → clear any stale presence
+                    # so we don't fire stale persistent-refires when it reactivates.
+                    if not state.is_active_now():
+                        if state.target_present:
+                            log(f"⏸ {cfg['label']} window closed — clearing state")
+                            state.target_present = False
+                            state.consecutive_refires = 0
+                            state.empty_yolo_count = 0
                         continue
 
-                # Fire
-                trigger_kind = "persistent-refire" if state.target_present else "rising-edge"
-                if trigger_kind == "persistent-refire":
-                    state.consecutive_refires += 1
-                state.target_present = True
-                stats[f"{key}_fired"] += 1
-                save_capture(frame, cfg["label"])
+                    conf = yolo_results.get(key, 0.0)
+                    if conf == 0.0:
+                        # Not detected this frame
+                        state.empty_yolo_count += 1
+                        if (state.target_present
+                                and state.empty_yolo_count >= TARGET_GONE_AFTER_N_EMPTY):
+                            log(f"⏸ {cfg['label']} left the frame "
+                                f"(after {state.empty_yolo_count} empty YOLO checks)")
+                            state.target_present = False
+                            state.consecutive_refires = 0
+                        continue
 
-                if state.consecutive_refires >= cfg["habituation_threshold"]:
-                    # Stubborn target — louder phone alert, then play the
-                    # human-summoning sound. send_alert fires first so the
-                    # phone buzzes before audio playback blocks the loop.
-                    save_capture(frame, "habituated")
-                    send_alert(
-                        title=f"HUMAN ALARM - {cfg['label']} won't leave",
-                        message=f"{state.consecutive_refires} refires in a row. Go outside.",
-                        frame=frame,
-                        priority="urgent",
-                        tag="rotating_light",
-                    )
-                    state.play_alarm(
-                        reason=f"{cfg['label']} won't leave — "
-                               f"{state.consecutive_refires} refires in a row"
-                    )
-                elif trigger_kind == "rising-edge":
-                    # New arrival — log the catch on your phone (default priority,
-                    # your phone decides whether to play a sound). Persistent-refires
-                    # of the same target intentionally do NOT alert again — you've
-                    # already been told it's there; no need to buzz twice.
-                    claude_note = f", Claude {claude_ms:.0f}ms" if cfg["use_claude"] else ""
-                    send_alert(
-                        title=f"crowbuster - {cfg['label']} detected",
-                        message=f"YOLO conf {conf:.2f}{claude_note}.",
-                        frame=frame,
-                        priority="default",
-                        tag="owl",
-                    )
-                    state.play_distress(reason=f"{cfg['label']}, {trigger_kind}")
-                else:
-                    state.play_distress(reason=f"{cfg['label']}, {trigger_kind}")
-                state.last_trigger = now
+                    # Detected this frame
+                    state.empty_yolo_count = 0
+                    stats[f"{key}_found"] += 1
+                    log(f"  → YOLO: {cfg['yolo_class']} FOUND "
+                        f"({cfg['label']}, conf={conf:.2f}, {yolo_ms:.0f}ms)")
 
-            time.sleep(LOOP_INTERVAL)
+                    # Rising-edge gate
+                    if (state.target_present
+                            and now - state.last_trigger < cfg["persistent_refire_seconds"]):
+                        log(f"  → {cfg['label']} still in frame — not re-firing")
+                        continue
+
+                    # Stage 3: optional Claude refinement
+                    if cfg["use_claude"]:
+                        t0 = time.time()
+                        confirmed = is_target_via_claude(frame, cfg["claude_prompt"])
+                        claude_ms = (time.time() - t0) * 1000
+                        log(f"  → Claude({cfg['label']}): "
+                            f"{'YES' if confirmed else 'no'} ({claude_ms:.0f}ms)")
+                        if not confirmed:
+                            save_capture(frame, f"{cfg['yolo_class']}_not_{cfg['label']}")
+                            continue
+
+                    # Fire
+                    trigger_kind = "persistent-refire" if state.target_present else "rising-edge"
+                    if trigger_kind == "persistent-refire":
+                        state.consecutive_refires += 1
+                    state.target_present = True
+                    stats[f"{key}_fired"] += 1
+                    save_capture(frame, cfg["label"])
+
+                    if state.consecutive_refires >= cfg["habituation_threshold"]:
+                        # Stubborn target — louder phone alert, then play the
+                        # human-summoning sound. send_alert fires first so the
+                        # phone buzzes before audio playback blocks the loop.
+                        save_capture(frame, "habituated")
+                        send_alert(
+                            title=f"HUMAN ALARM - {cfg['label']} won't leave",
+                            message=f"{state.consecutive_refires} refires in a row. Go outside.",
+                            frame=frame,
+                            priority="urgent",
+                            tag="rotating_light",
+                        )
+                        state.play_alarm(
+                            reason=f"{cfg['label']} won't leave — "
+                                   f"{state.consecutive_refires} refires in a row"
+                        )
+                    elif trigger_kind == "rising-edge":
+                        # New arrival — log the catch on your phone (default priority,
+                        # your phone decides whether to play a sound). Persistent-refires
+                        # of the same target intentionally do NOT alert again — you've
+                        # already been told it's there; no need to buzz twice.
+                        claude_note = f", Claude {claude_ms:.0f}ms" if cfg["use_claude"] else ""
+                        send_alert(
+                            title=f"crowbuster - {cfg['label']} detected",
+                            message=f"YOLO conf {conf:.2f}{claude_note}.",
+                            frame=frame,
+                            priority="default",
+                            tag="owl",
+                        )
+                        state.play_distress(reason=f"{cfg['label']}, {trigger_kind}")
+                    else:
+                        state.play_distress(reason=f"{cfg['label']}, {trigger_kind}")
+                    state.last_trigger = now
+
+                time.sleep(LOOP_INTERVAL)
+
+            except KeyboardInterrupt:
+                raise  # let the outer handler do clean shutdown
+            except Exception as e:
+                log(f"loop iteration crashed (continuing): {type(e).__name__}: {e}")
+                time.sleep(LOOP_INTERVAL)
 
     except KeyboardInterrupt:
         log("shutdown requested")
         send_shutdown_ping("Ctrl+C / SIGTERM")
     except Exception as e:
+        # Only reaches here if something OUTSIDE the loop body fails (setup,
+        # finally block, etc). The per-iteration handler above catches
+        # everything during the actual detection loop.
         log(f"FATAL: unhandled exception: {type(e).__name__}: {e}")
         send_shutdown_ping(f"crash: {type(e).__name__}: {e}")
-        raise
     finally:
         cam.release()
         screen_on()
