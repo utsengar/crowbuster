@@ -156,6 +156,17 @@ Push a notification to your phone with the triggering frame attached every time 
 
 Persistent-refires of the *same* target intentionally do NOT re-alert — once you know a crow is on the porch, you don't need 4 more buzzes over the next 10 minutes. New animal = new ping.
 
+**Health-check pings** ride on the same channel so you know the system is alive even when no predators have visited:
+
+| Signal | Priority | Tag | When |
+|---|---|---|---|
+| `🟢 crowbuster started` | low | 🟢 | Process startup (after reboot, systemd restart, manual launch) |
+| `🟢 crowbuster operational` | low | ❤️ | Every `CROWBUSTER_HEARTBEAT_HOURS` (default 12h) with uptime + per-target stats |
+| `🟡 crowbuster stopped` | default | 🟡 | Graceful shutdown (Ctrl+C, SIGTERM) or fatal crash |
+| `🚨 CAMERA DEAD` | urgent | ⚠️ | After 5 consecutive `cv2.VideoCapture.read()` failures — script alive but blind |
+
+The heartbeat pings are designed to be quiet — you won't notice them. The signal is the **absence** of them. If you don't see a `🟢 operational` ping for >24h, the laptop's Wi-Fi died, sshd is gone, or the process crashed. The script can't alert you when the box is fully offline; this is the only reliable indicator of that case.
+
 1. Pick a hard-to-guess topic name (e.g. `crowbuster-utkarsh-7g3pq`). **Anyone who knows the topic can read your alerts**, so don't pick something obvious.
 2. Install the **ntfy** app — [iOS](https://apps.apple.com/us/app/ntfy/id1625396347), [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy), or just open `ntfy.sh/<your-topic>` in a browser.
 3. Subscribe to your topic in the app.

@@ -181,6 +181,14 @@ if TEST_MODE:
 NTFY_TOPIC = os.environ.get("CROWBUSTER_NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("CROWBUSTER_NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 
+# Periodic health-check pings to ntfy so you know the system is alive even
+# when no predators have shown up in a while. Default: every 12h. Absence of
+# the ping is the signal — if you don't see a "🟢 operational" notification
+# for >24h, the laptop/Wi-Fi/sshd has probably died and you need to go
+# investigate physically.
+HEARTBEAT_PING_HOURS = float(os.environ.get("CROWBUSTER_HEARTBEAT_HOURS", "12"))
+CAMERA_FAILURE_ALERT_AFTER = 5  # consecutive camera-reopen failures before urgent ntfy
+
 # --- Setup -----------------------------------------------------------------
 if not os.environ.get("ANTHROPIC_API_KEY"):
     raise SystemExit("Set ANTHROPIC_API_KEY in your environment")
@@ -364,6 +372,74 @@ def send_alert(title: str, message: str, frame=None, priority: str = "default",
         log(f"ntfy alert failed: {e}")
 
 
+# --- Health-check pings -----------------------------------------------------
+# Three signals tell you the system is OK or in trouble:
+#   1. Startup ping  — confirms crowbuster came up cleanly (after reboot/crash)
+#   2. Heartbeat ping — periodic "alive" check-in; absence = something is wrong
+#   3. Shutdown ping — confirms clean exit (ctrl+c, systemd stop, or crash)
+# Plus an urgent alert on persistent camera failure (script is alive but blind).
+
+def _format_uptime(seconds: float) -> str:
+    hours = seconds / 3600
+    if hours < 1:
+        return f"{seconds / 60:.0f}m"
+    if hours < 48:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
+def send_startup_ping() -> None:
+    """Confirm crowbuster is up. Low priority — informational."""
+    targets = ", ".join(TARGETS.keys()) or "(none)"
+    mode = "TEST" if TEST_MODE else "production"
+    send_alert(
+        title="🟢 crowbuster started",
+        message=f"Pipeline online [{mode}]. Watching: {targets}.",
+        priority="low",
+        tag="green_circle",
+    )
+
+
+def send_heartbeat_ping(stats: dict, uptime_seconds: float) -> None:
+    """Periodic 'still alive' check-in. Low priority so it doesn't interrupt
+    you; the signal is the regular cadence, not any one ping. Stops arriving
+    when the laptop/Wi-Fi/sshd dies — that's how you know to investigate."""
+    detail = " · ".join(
+        f"{k} {stats.get(f'{k}_found', 0)}/{stats.get(f'{k}_fired', 0)}"
+        for k in TARGETS
+    )
+    send_alert(
+        title="🟢 crowbuster operational",
+        message=f"Up {_format_uptime(uptime_seconds)}. "
+                f"Frames={stats.get('frames', 0)} YOLO={stats.get('yolo_runs', 0)}. "
+                f"Per-target found/fired: {detail}.",
+        priority="low",
+        tag="heart",
+    )
+
+
+def send_shutdown_ping(reason: str) -> None:
+    """Notify on exit so you know if systemd kept it down. Default priority."""
+    send_alert(
+        title="🟡 crowbuster stopped",
+        message=f"Process exiting: {reason}. "
+                f"If you didn't stop it, check systemd / Wi-Fi / disk space.",
+        priority="default",
+        tag="yellow_circle",
+    )
+
+
+def send_camera_failure_alert(consecutive: int) -> None:
+    """Camera is dead — pipeline can't see anything. URGENT (DND override)."""
+    send_alert(
+        title="🚨 crowbuster — CAMERA DEAD",
+        message=f"{consecutive} consecutive camera read failures. "
+                f"Detection is BLIND. Check the USB cam / /dev/video0.",
+        priority="urgent",
+        tag="warning",
+    )
+
+
 _save_count = 0
 
 
@@ -497,6 +573,7 @@ def main() -> None:
     print_banner()
     log(f"crowbuster started [{'TEST' if TEST_MODE else 'production'}]")
     prune_captures()  # clean up any backlog from a long-stopped previous run
+    send_startup_ping()
 
     # Translate SIGTERM into KeyboardInterrupt so the finally block restores the screen.
     def _on_sigterm(_signum, _frame):
@@ -508,6 +585,7 @@ def main() -> None:
     cam = cv2.VideoCapture(CAMERA_INDEX)
     if not cam.isOpened():
         log("FATAL: cannot open camera")
+        send_shutdown_ping("FATAL: cannot open camera at startup")
         screen_on()
         return
 
@@ -523,6 +601,10 @@ def main() -> None:
     was_motion = False
     last_heartbeat = 0.0
     last_stats = time.time()
+    start_time = time.time()
+    last_heartbeat_ping = time.time()      # don't fire one right at startup
+    consecutive_camera_failures = 0
+    camera_alert_sent = False              # latch — alert once per outage, not every retry
     iteration = 0
     stats: dict[str, int] = {"frames": 0, "motion": 0, "yolo_runs": 0}
     for key in TARGETS:
@@ -537,6 +619,14 @@ def main() -> None:
             if now - last_heartbeat > HEARTBEAT_SECONDS:
                 write_heartbeat()
                 last_heartbeat = now
+
+            # Periodic "alive" ping to ntfy. Default 12h. Absence is the signal —
+            # if you stop seeing these for >24h, the system died and you need
+            # to investigate physically (the script can't alert when the box is
+            # offline; this is the only reliable indicator of that case).
+            if now - last_heartbeat_ping > HEARTBEAT_PING_HOURS * 3600:
+                send_heartbeat_ping(stats, now - start_time)
+                last_heartbeat_ping = now
 
             if now - last_stats > STATS_INTERVAL_SECONDS:
                 parts = [
@@ -558,11 +648,21 @@ def main() -> None:
 
             ok, frame = cam.read()
             if not ok:
-                log("camera read failed; reopening")
+                consecutive_camera_failures += 1
+                log(f"camera read failed (#{consecutive_camera_failures}); reopening")
+                if (consecutive_camera_failures >= CAMERA_FAILURE_ALERT_AFTER
+                        and not camera_alert_sent):
+                    send_camera_failure_alert(consecutive_camera_failures)
+                    camera_alert_sent = True
                 cam.release()
                 time.sleep(2)
                 cam = cv2.VideoCapture(CAMERA_INDEX)
                 continue
+            # Camera back — reset the alert latch so a future outage notifies again
+            if consecutive_camera_failures > 0:
+                log(f"camera recovered after {consecutive_camera_failures} failures")
+                consecutive_camera_failures = 0
+                camera_alert_sent = False
             stats["frames"] += 1
 
             # Stage 1: motion — shared across all targets
@@ -686,6 +786,11 @@ def main() -> None:
 
     except KeyboardInterrupt:
         log("shutdown requested")
+        send_shutdown_ping("Ctrl+C / SIGTERM")
+    except Exception as e:
+        log(f"FATAL: unhandled exception: {type(e).__name__}: {e}")
+        send_shutdown_ping(f"crash: {type(e).__name__}: {e}")
+        raise
     finally:
         cam.release()
         screen_on()
