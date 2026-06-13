@@ -12,3 +12,9 @@ please open an issue on the repository.
 
 If you publish this repo, link back to the HME Products page
 above rather than hosting the mp3s on the public repo.
+
+Cat-deterrent audio in sounds/cat/:
+  ultrasonic-20khz.mp3 — generated locally with sox:
+    sox -n -r 48000 -c 1 ultrasonic-20khz.mp3 synth 8 sine 20000 vol 0.9
+  See docs/cat-deterrence.md for the rationale (ultrasonic only, not
+  audible distress audio — crow-style files actively attract cats).

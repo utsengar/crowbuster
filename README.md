@@ -271,6 +271,8 @@ YOLO runs **once per frame** and routes each detection to the right state machin
 
 YOLO "cat" or "dog" are already specific. A cat on your porch is the threat — no disambiguation needed. Set `use_claude: False` and skip the API call entirely. Adds zero per-detection cost.
 
+> **Heads up:** the cat path uses a fundamentally different deterrence strategy than the bird path — crow distress audio doesn't work on cats (it *attracts* them as a prey signal), so the cat target relies on ultrasonic tones + phone notifications instead. The full reasoning, research, and design implications are in **[docs/cat-deterrence.md](docs/cat-deterrence.md)**. Read it before adding any new mammal targets.
+
 ### Adding a new target
 
 1. Find the COCO class in `yolo.names` (e.g. `dog=16`, `bear=21`). Common predators: cat, dog, bear, raccoon (not in COCO — would need Claude-only).
