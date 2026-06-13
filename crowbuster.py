@@ -372,8 +372,12 @@ def send_alert(title: str, message: str, frame=None, priority: str = "default",
         with urllib.request.urlopen(req, timeout=5):
             pass
         log(f"📲 phone alert sent to ntfy/{NTFY_TOPIC} ({priority})")
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
-        log(f"ntfy alert failed: {e}")
+    except Exception as e:
+        # Broad catch on purpose — notifications must NEVER break the loop.
+        # Common cases: URLError (network), OSError, TimeoutError, and
+        # UnicodeEncodeError if a header contained non-ASCII (HTTP headers
+        # are ASCII-only; UTF-8 in Title crashes urllib).
+        log(f"ntfy alert failed: {type(e).__name__}: {e}")
 
 
 # --- Health-check pings -----------------------------------------------------
@@ -393,11 +397,13 @@ def _format_uptime(seconds: float) -> str:
 
 
 def send_startup_ping() -> None:
-    """Confirm crowbuster is up. Low priority — informational."""
+    """Confirm crowbuster is up. Low priority — informational.
+    Title is ASCII-only (HTTP header constraint); the Tags header renders
+    the visual emoji on the phone."""
     targets = ", ".join(TARGETS.keys()) or "(none)"
     mode = "TEST" if TEST_MODE else "production"
     send_alert(
-        title="🟢 crowbuster started",
+        title="crowbuster started",
         message=f"Pipeline online [{mode}]. Watching: {targets}.",
         priority="low",
         tag="green_circle",
@@ -408,12 +414,12 @@ def send_heartbeat_ping(stats: dict, uptime_seconds: float) -> None:
     """Periodic 'still alive' check-in. Low priority so it doesn't interrupt
     you; the signal is the regular cadence, not any one ping. Stops arriving
     when the laptop/Wi-Fi/sshd dies — that's how you know to investigate."""
-    detail = " · ".join(
+    detail = " | ".join(
         f"{k} {stats.get(f'{k}_found', 0)}/{stats.get(f'{k}_fired', 0)}"
         for k in TARGETS
     )
     send_alert(
-        title="🟢 crowbuster operational",
+        title="crowbuster operational",
         message=f"Up {_format_uptime(uptime_seconds)}. "
                 f"Frames={stats.get('frames', 0)} YOLO={stats.get('yolo_runs', 0)}. "
                 f"Per-target found/fired: {detail}.",
@@ -425,7 +431,7 @@ def send_heartbeat_ping(stats: dict, uptime_seconds: float) -> None:
 def send_shutdown_ping(reason: str) -> None:
     """Notify on exit so you know if systemd kept it down. Default priority."""
     send_alert(
-        title="🟡 crowbuster stopped",
+        title="crowbuster stopped",
         message=f"Process exiting: {reason}. "
                 f"If you didn't stop it, check systemd / Wi-Fi / disk space.",
         priority="default",
@@ -436,7 +442,7 @@ def send_shutdown_ping(reason: str) -> None:
 def send_camera_failure_alert(consecutive: int) -> None:
     """Camera is dead — pipeline can't see anything. URGENT (DND override)."""
     send_alert(
-        title="🚨 crowbuster — CAMERA DEAD",
+        title="crowbuster - CAMERA DEAD",
         message=f"{consecutive} consecutive camera read failures. "
                 f"Detection is BLIND. Check the USB cam / /dev/video0.",
         priority="urgent",
@@ -758,7 +764,7 @@ def main() -> None:
                     # phone buzzes before audio playback blocks the loop.
                     save_capture(frame, "habituated")
                     send_alert(
-                        title=f"🆘 HUMAN ALARM — {cfg['label']} won't leave",
+                        title=f"HUMAN ALARM - {cfg['label']} won't leave",
                         message=f"{state.consecutive_refires} refires in a row. Go outside.",
                         frame=frame,
                         priority="urgent",
@@ -775,7 +781,7 @@ def main() -> None:
                     # already been told it's there; no need to buzz twice.
                     claude_note = f", Claude {claude_ms:.0f}ms" if cfg["use_claude"] else ""
                     send_alert(
-                        title=f"crowbuster — {cfg['label']} detected",
+                        title=f"crowbuster - {cfg['label']} detected",
                         message=f"YOLO conf {conf:.2f}{claude_note}.",
                         frame=frame,
                         priority="default",
