@@ -39,6 +39,9 @@ RSYNC_ARGS=(
   --exclude='captures'
   --exclude='.git'
   --exclude='yolov8n.pt'
+  # Per-machine secrets — never sync. Each host owns its own .env. Previously
+  # caused eva's CROWBUSTER_NTFY_TOPIC to be silently clobbered on every sync.
+  --exclude='.env'
 )
 
 echo "Initial sync $LOCAL_PATH -> $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH"

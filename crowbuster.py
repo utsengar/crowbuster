@@ -142,8 +142,12 @@ TARGETS: dict[str, dict] = {
         "use_claude": False,                # YOLO "cat" is specific enough
         "claude_prompt": None,
         "active_hours": "always",           # cats come at midnight
-        "persistent_refire_seconds": 210,
-        "habituation_threshold": 2,
+        # Cats are stalkers, not raiders. If one sits near the nest for 30s
+        # it's actively hunting, not just passing through — escalate fast.
+        # Refire at 30s, habituation_threshold=1 means the very first
+        # persistent-refire IS the HUMAN ALARM (urgent ntfy + alarm.wav).
+        "persistent_refire_seconds": 30,
+        "habituation_threshold": 1,
     },
 }
 
