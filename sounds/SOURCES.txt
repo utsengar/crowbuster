@@ -14,7 +14,11 @@ If you publish this repo, link back to the HME Products page
 above rather than hosting the mp3s on the public repo.
 
 Cat-deterrent audio in sounds/cat/:
-  ultrasonic-20khz.mp3 — generated locally with sox:
-    sox -n -r 48000 -c 1 ultrasonic-20khz.mp3 synth 8 sine 20000 vol 0.9
-  See docs/cat-deterrence.md for the rationale (ultrasonic only, not
-  audible distress audio — crow-style files actively attract cats).
+  dog-bark.mp3 — "Dog barking at door" by trashcan_studios on freesound.org
+    Source: https://freesound.org/s/580213/
+    Trimmed/re-encoded with sox (192 kbps mp3) from the original 24-bit wav.
+  See docs/cat-deterrence.md for the rationale and known limits
+  (audible dog bark; habituates within days; the real cat defense is the
+  phone notification, not the speaker). Earlier attempts at ultrasonic
+  20 kHz failed in practice because consumer Bluetooth speakers roll off
+  above ~19 kHz — that file has been removed.
