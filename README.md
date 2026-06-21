@@ -6,17 +6,17 @@ A computer-vision sentry that watches a bird nest, identifies predators in real 
 
 ## How it works
 
-A three-stage detection pipeline, cheapest checks first. Each stage is a filter; only frames that pass make it to the next. The Claude refinement step is per-target and optional — broad YOLO classes (like "bird" → really a crow?) use it, specific ones (like "cat") skip it to save cost.
+A three-stage detection pipeline, cheapest checks first. Each stage is a filter; only frames that pass make it to the next. The Claude refinement step is per-target and configurable — every target currently uses it (crow disambiguates `bird` → corvid; cat backstops phantom-cat HUMAN ALARMs from raccoon/plush/shadow misfires).
 
 ```
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐
 │   Webcam     │──▶│ 1. Motion    │──▶│ 2. YOLOv8n   │──▶│ 3. Claude (opt)  │
-│  every 1s    │    │ (cv2 absdiff)│    │  "bird?      │    │  "is the bird    │
-│              │    │  ~5ms, free  │    │   cat?       │    │   a crow?"       │
+│  every 1s    │    │ (cv2 absdiff)│    │  "bird?      │    │  "is it really   │
+│              │    │  ~5ms, free  │    │   cat?       │    │   a crow / cat?" │
 │              │    │              │    │   dog? ..."  │    │ ~600ms, paid     │
-│              │    │              │    │ ~140ms, free │    │ skipped for cat  │
+│              │    │              │    │ ~140ms, free │    │ reason logged    │
 └──────────────┘    └──────┬───────┘    └──────┬───────┘    └────────┬─────────┘
-                            │ no                │ no                  │ yes / skipped
+                            │ no                │ no                  │ yes
                             ▼                   ▼                     ▼
                           skip                skip          🚨 Play target-specific
                                                               deterrent through
@@ -39,8 +39,8 @@ Stubborn-crow insurance: if a crow refuses to leave and stays in frame longer th
 A false positive plays an extra speaker sound. A false negative means dead eggs. So every stage in the pipeline escalates on uncertainty:
 
 - Motion borderline → run YOLO anyway every 30th frame (catches silent landings)
-- YOLO confidence low (0.25 threshold) → still escalate to Claude
-- Claude API errors, network out, or unclear response → **fire the speaker anyway**
+- YOLO confidence above per-target threshold (0.35 crow, 0.25 cat) → escalate to Claude
+- Claude API errors, network out, or unparseable response → **fire the speaker anyway** (the YES-bias lives in the error path, not in the prompt — see `is_target_via_claude`)
 
 ### Habituated-crow escalation
 
@@ -65,14 +65,14 @@ Add `sounds/alarm.wav` to enable. The script falls back to a regular distress so
 ```
 [15:20:01] crowbuster started [production] (model=claude-haiku-4-5, loop=1s)
 [15:20:03] ⏵ motion started (diff=12.4)
-[15:20:03]   → YOLO: bird FOUND (conf=0.87, 142ms)
-[15:20:04]   → Claude: YES (612ms)
-[15:20:04] 🚨 SPEAKER FIRED (crow) — playing 116-Crow & Hawk Fight.mp3
-[15:20:08]   → YOLO: bird FOUND (conf=0.91, 138ms)
+[15:20:03]   → YOLO: bird FOUND (crow, conf=0.87, 142ms)
+[15:20:04]   → Claude(crow): YES — large all-black corvid, heavy bill visible (612ms)
+[15:20:04] 🚨 SPEAKER FIRED (crow, rising-edge) — playing 116-Crow & Hawk Fight.mp3
+[15:20:08]   → YOLO: bird FOUND (crow, conf=0.91, 138ms)
 [15:20:08]   → crow still in frame — not re-firing
 [15:20:35] ⏸ motion stopped (diff=2.1)
 [15:20:45] ⏸ crow left the frame (after 5 empty YOLO checks)
-[15:25:00] stats: frames=300 motion=42 yolo=18 birds=4 crows=2
+[15:25:00] stats: frames=300 motion=42 yolo=18 crow_found=4 crow_fired=2
 ```
 
 Every 5 minutes a stats line summarizes pipeline activity, so you can verify the script is alive even when there's nothing to report.
@@ -194,7 +194,7 @@ You'll see `crowbuster started [TEST]` in the startup log along with a `targets:
 |---|---|---|
 | Motion | `⏵ motion started (diff=12.4)` | Camera + frame diff working |
 | YOLO | `→ YOLO: person FOUND (human, conf=0.87, 142ms)` | Local model loaded, person class detected |
-| Claude | `→ Claude(human): YES (612ms)` | API key + network working |
+| Claude | `→ Claude(human): YES — person clearly visible in frame (612ms)` | API key + network working (the trailing `— reason` is Claude's brief explanation, logged for false-positive auditing) |
 | Speaker | `🚨 SPEAKER FIRED (human, rising-edge)` | Bluetooth speaker + audio path working |
 
 Walk out of frame, wait 5+ seconds, walk back in — speaker should fire again (rising-edge). If it fires while you're stationary, that's the persistent-refire safety kicking in after 3 minutes.
@@ -243,10 +243,10 @@ TARGETS = {
     "crow": {
         "yolo_class": "bird",              # COCO class YOLO looks for
         "label": "crow",                   # appears in logs / capture filenames
-        "min_confidence": 0.25,            # YOLO threshold (0.0–1.0)
+        "min_confidence": 0.35,            # YOLO threshold (0.0–1.0)
         "sounds_dir": HERE / "sounds",     # folder of *.mp3 deterrents
         "use_claude": True,                # refine YOLO → "is it really a crow?"
-        "claude_prompt": "Is there a crow…",
+        "claude_prompt": "A motion-triggered camera…",
         "active_hours": "daylight",        # "daylight" or "always"
         "persistent_refire_seconds": 210,
         "habituation_threshold": 2,
@@ -256,7 +256,9 @@ TARGETS = {
         "label": "cat",
         "min_confidence": 0.25,
         "sounds_dir": HERE / "sounds" / "cat",
-        "use_claude": False,               # YOLO "cat" is precise enough — saves API cost
+        "use_claude": True,                # backstops phantom-cat HUMAN ALARMs
+                                           # from raccoon / plush / shadow misfires
+        "claude_prompt": "A motion-triggered camera…",
         "active_hours": "always",          # cats are mostly nocturnal
         ...
     },
@@ -265,13 +267,13 @@ TARGETS = {
 
 YOLO runs **once per frame** and routes each detection to the right state machine — adding targets doesn't multiply CPU cost. Each target keeps its own presence/refire/cooldown bookkeeping in a `TargetState` instance.
 
-### Why some targets skip Claude
+### When to use Claude refinement
 
-`use_claude: True` is for cases where YOLO's class is broader than the actual predator. YOLO "bird" includes the resident parents on the nest, so a second-stage Claude call asks the narrower question "is this a crow?" before firing.
+`use_claude: True` is for cases where YOLO alone produces too many false positives — either because YOLO's class is too broad (`bird` includes the resident parents, not just crows) or because YOLO's class is precise but the downstream consequences of a false positive are severe (the cat path escalates to HUMAN ALARM after one persistent refire, so a single phantom detection is loud).
 
-YOLO "cat" or "dog" are already specific. A cat on your porch is the threat — no disambiguation needed. Set `use_claude: False` and skip the API call entirely. Adds zero per-detection cost.
+For both current targets, Claude is the safety net. Set `use_claude: False` only if both (a) YOLO's class is precise and (b) a false fire is cheap.
 
-> **Heads up:** the cat path uses a fundamentally different deterrence strategy than the bird path — crow distress audio doesn't work on cats (it *attracts* them as a prey signal), so the cat target relies on ultrasonic tones + phone notifications instead. The full reasoning, research, and design implications are in **[docs/cat-deterrence.md](docs/cat-deterrence.md)**. Read it before adding any new mammal targets.
+> **Heads up:** the cat path uses a fundamentally different deterrence strategy than the bird path — crow distress audio doesn't work on cats (it *attracts* them as a prey signal). The cat target uses a dog-bark recording for the speaker and leans on phone notifications as the primary defense. The full reasoning, history (including the failed ultrasonic experiment), and design implications are in **[docs/cat-deterrence.md](docs/cat-deterrence.md)**. Read it before adding any new mammal targets.
 
 ### Adding a new target
 
@@ -285,9 +287,9 @@ With rising-edge triggering, Claude is only called on new appearances, so API co
 
 | Stage | Cost |
 |---|---|
-| Motion + YOLO (when no bird present) | $0 |
-| YOLO triggers + Claude (per bird visit) | ~$0.002 |
-| Typical daily bird visits | ~10–50 |
+| Motion + YOLO (when nothing in frame) | $0 |
+| YOLO triggers + Claude (per crow or cat visit, including the reason logged) | ~$0.002 |
+| Typical daily visits (crow + cat combined) | ~10–50 |
 | Estimated total | **~$1–3 / month** |
 
 If even that's too much, raise `LOOP_INTERVAL` (slower scan) or remove the Claude stage entirely — but then YOLO will fire the speaker on any bird, scaring the nesting birds you're trying to protect. Don't do that.

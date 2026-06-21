@@ -122,13 +122,24 @@ TARGETS: dict[str, dict] = {
     "crow": {
         "yolo_class": "bird",
         "label": "crow",
-        "min_confidence": 0.25,
+        "min_confidence": 0.35,             # Tuned up from 0.25 after small-bird
+                                            # false-fires. Claude still backstops
+                                            # anything that gets past 0.35.
         "sounds_dir": HERE / "sounds",      # flat layout — existing crow mp3s
         "use_claude": True,                 # YOLO "bird" includes the resident
                                             # parents; Claude refines to corvid
         "claude_prompt": (
-            "Is there a crow, raven, or other large dark corvid bird in this "
-            "image? If uncertain, answer YES. Reply with only YES or NO."
+            "A motion-triggered camera flagged a possible crow on a residential "
+            "porch. Look at the image and answer: is there clearly a crow, raven, "
+            "or other large all-dark corvid?\n\n"
+            "Crows are large (pigeon-sized or bigger), uniformly black or very "
+            "dark gray, with a heavy straight bill.\n\n"
+            "Not crows: pigeons, doves, sparrows, finches, robins, jays, and any "
+            "small or light-colored bird.\n\n"
+            "Respond in this exact format:\n"
+            "YES — <up to 10 words why>\n"
+            "or\n"
+            "NO — <up to 10 words why>"
         ),
         "active_hours": "daylight",
         "persistent_refire_seconds": 210,
@@ -137,10 +148,22 @@ TARGETS: dict[str, dict] = {
     "cat": {
         "yolo_class": "cat",
         "label": "cat",
-        "min_confidence": 0.25,
+        "min_confidence": 0.25,             # Stays low; Claude refinement below
+                                            # is the safety net, not the threshold.
         "sounds_dir": HERE / "sounds" / "cat",
-        "use_claude": False,                # YOLO "cat" is specific enough
-        "claude_prompt": None,
+        "use_claude": True,                 # YOLO "cat" alone caused phantom
+                                            # HUMAN ALARMs (raccoons, plush, shadows).
+        "claude_prompt": (
+            "A motion-triggered camera flagged a possible cat on a residential "
+            "porch. Look at the image and answer: is there clearly a cat?\n\n"
+            "Cats have four legs, fur, a feline body silhouette, and a tail.\n\n"
+            "Common false positives in this camera: raccoons, dark plush items, "
+            "shadows on textiles, dogs.\n\n"
+            "Respond in this exact format:\n"
+            "YES — <up to 10 words why>\n"
+            "or\n"
+            "NO — <up to 10 words why>"
+        ),
         "active_hours": "always",           # cats come at midnight
         # Cats are stalkers, not raiders. If one sits near the nest for 30s
         # it's actively hunting, not just passing through — escalate fast.
@@ -166,8 +189,13 @@ if TEST_MODE:
             "sounds_dir": HERE / "sounds",
             "use_claude": True,
             "claude_prompt": (
-                "Is there a human (person) visible in this image? "
-                "Reply with only YES or NO."
+                "A motion-triggered camera flagged a possible person on a "
+                "residential porch. Look at the image and answer: is there "
+                "clearly a human visible?\n\n"
+                "Respond in this exact format:\n"
+                "YES — <up to 10 words why>\n"
+                "or\n"
+                "NO — <up to 10 words why>"
             ),
             "active_hours": "always",
             "persistent_refire_seconds": 10,
@@ -252,15 +280,17 @@ def detect_targets(frame) -> dict[str, float]:
     return found
 
 
-def is_target_via_claude(frame, prompt: str) -> bool:
+def is_target_via_claude(frame, prompt: str) -> tuple[bool, str]:
     """Stage 3 (optional, per-target): Claude vision refinement.
-    Fails toward True (alarm) on any error."""
+    Returns (decision, reason). The 'fail toward alarm' bias lives here, in
+    the error path — NOT in the prompt — so prompts can be neutrally worded
+    and we still alarm on API failures or malformed responses."""
     _, buf = cv2.imencode(".jpg", frame)
     image_b64 = base64.b64encode(buf).decode("utf-8")
     try:
         response = client.messages.create(
             model=MODEL,
-            max_tokens=10,
+            max_tokens=50,
             messages=[
                 {
                     "role": "user",
@@ -280,12 +310,46 @@ def is_target_via_claude(frame, prompt: str) -> bool:
         )
         for block in response.content:
             if block.type == "text":
-                return block.text.strip().upper().startswith("YES")
+                return _parse_claude_verdict(block.text)
         log("Claude response had no text block — failing toward alarm")
-        return True
+        return True, "no text block"
     except anthropic.APIError as e:
         log(f"Claude API error: {e} — failing toward alarm")
-        return True
+        return True, f"API error: {type(e).__name__}"
+
+
+def _parse_claude_verdict(text: str) -> tuple[bool, str]:
+    """Split Claude's reply into (decision, reason).
+    Decision: first non-whitespace word starts with YES → True, NO → False.
+    Reason: whatever follows the YES/NO token, stripped of leading separators
+    (— - , : whitespace). Empty if no reason given."""
+    stripped = text.strip()
+    upper = stripped.upper()
+    if upper.startswith("YES"):
+        decision = True
+        rest = stripped[3:]
+    elif upper.startswith("NO"):
+        decision = False
+        rest = stripped[2:]
+    else:
+        # Unexpected output — fail toward alarm, surface raw text as reason
+        return True, f"unparseable: {stripped[:40]}"
+    reason = rest.lstrip(" \t—-,:.\n").strip()
+    return decision, reason
+
+
+def _reason_slug(reason: str, max_len: int = 40) -> str:
+    """Filesystem-safe slug for capture filenames."""
+    if not reason:
+        return ""
+    out = []
+    for ch in reason.lower():
+        if ch.isalnum():
+            out.append(ch)
+        elif out and out[-1] != "_":
+            out.append("_")
+    slug = "".join(out).strip("_")
+    return slug[:max_len].rstrip("_")
 
 
 def _play_file(path: Path, log_line: str) -> None:
@@ -757,14 +821,24 @@ def main() -> None:
                         continue
 
                     # Stage 3: optional Claude refinement
+                    claude_reason = ""
                     if cfg["use_claude"]:
                         t0 = time.time()
-                        confirmed = is_target_via_claude(frame, cfg["claude_prompt"])
+                        confirmed, claude_reason = is_target_via_claude(
+                            frame, cfg["claude_prompt"]
+                        )
                         claude_ms = (time.time() - t0) * 1000
-                        log(f"  → Claude({cfg['label']}): "
-                            f"{'YES' if confirmed else 'no'} ({claude_ms:.0f}ms)")
+                        verdict = "YES" if confirmed else "no"
+                        reason_note = f" — {claude_reason}" if claude_reason else ""
+                        log(f"  → Claude({cfg['label']}): {verdict}{reason_note} "
+                            f"({claude_ms:.0f}ms)")
                         if not confirmed:
-                            save_capture(frame, f"{cfg['yolo_class']}_not_{cfg['label']}")
+                            slug = _reason_slug(claude_reason)
+                            suffix = f"__{slug}" if slug else ""
+                            save_capture(
+                                frame,
+                                f"{cfg['yolo_class']}_not_{cfg['label']}{suffix}",
+                            )
                             continue
 
                     # Fire

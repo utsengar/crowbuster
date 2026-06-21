@@ -2,14 +2,17 @@
 
 This project started as a crow deterrent — predator-call audio played through a porch speaker to scare away corvids attacking a nest. When cat detection was added (PR #4), it turned out the playbook does **not** transfer. This doc captures the discovery so future contributors don't reach for "just play another distress call" by reflex.
 
+> **Update (2026-06-21):** the ultrasonic strategy was tried in production and didn't work — the porch Bluetooth speaker doesn't reproduce 20 kHz at any meaningful SPL. We've switched to a dog-bark file with eyes open about habituation. See "Why we abandoned ultrasonic in practice" below. Claude refinement was also added to the cat path after a phantom-cat HUMAN ALARM (YOLO solo was insufficient).
+
 ## TL;DR
 
 |  | Crows | Cats |
 |---|---|---|
-| Detection | YOLO `bird` + Claude refinement | YOLO `cat` (no Claude — skips API cost) |
-| Audio that works | Predator interaction (hawk fights, crow distress) | **Ultrasonic 18-22kHz only** |
+| Detection | YOLO `bird` + Claude refinement | YOLO `cat` + Claude refinement |
+| Audio that works | Predator interaction (hawk fights, crow distress) | Dog bark (short-term, habituates fast) |
 | Audio that BACKFIRES | — | **Crow distress** (signals prey to a cat) |
-| Habituation timeline | weeks | days for audible cues; slower for ultrasonic |
+| Audio we tried and dropped | — | Ultrasonic 20 kHz (speaker can't reproduce it) |
+| Habituation timeline | weeks | days for audible cues |
 | Primary defense | Speaker (audio is the workhorse) | **Phone notification** (audio is opportunistic) |
 
 ## Why the crow strategy works
@@ -27,18 +30,26 @@ Dogs are real cat predators, so a recording briefly works. But cats are pattern-
 ### Audible sirens and alarms also fail
 Sirens, whistles, anything in the standard audible range — cats startle once, then ignore. The cat-deterrent products on Amazon that play "scary noises" through audible speakers all have the same one-star-after-two-weeks reviews.
 
-## What actually works for cats
+## Why we abandoned ultrasonic in practice
 
-### Ultrasonic 18-22kHz
-Cats hear up to ~64kHz. Sustained tones become physically uncomfortable for them starting around 18kHz. Commercial ultrasonic deterrents (FERA-tested) reduce cat visits by ~46%. The mechanism is more habituation-resistant than audible cues because the frequencies are *physically* uncomfortable, not just unfamiliar — cats avoid the area instead of mapping it as safe.
+We tried `sounds/cat/ultrasonic-20khz.mp3` (pure 20 kHz sine, 8 s) for several weeks. The "Hardware caveat" below was the failure mode that won: the porch Bluetooth speaker doesn't reproduce frequencies that high at usable SPL, so the cat heard essentially nothing and kept showing up. We have no good way to measure speaker output above human hearing, so we couldn't tune our way out of it. The file has been removed from the repo. The `sox` generation snippets are kept below in case someone wants to retry on known-good hardware (a tweeter-rated wired speaker, an outdoor PA, etc.).
 
-**Our file**: `sounds/cat/ultrasonic-20khz.mp3` — a pure 20kHz sine, 8 seconds, generated locally with sox. See [Generation](#generation) below.
+The principle still holds — sustained 18-22 kHz tones do work on cats, when the speaker can actually emit them. We just don't have that speaker.
 
-### Hardware caveat: Bluetooth speakers roll off
-Most consumer Bluetooth speakers attenuate above 18-20kHz. The 20kHz tone we ship MAY come out at meaningfully reduced SPL depending on the speaker — there's no good way to know without testing on the actual hardware. Fallback: ship an 18kHz file as well; easier for speakers to reproduce, still painful to cats.
+## What we use now: dog bark (audible)
+
+`sounds/cat/dog-bark.mp3` — an 18-second "dog barking at door" sample from freesound.org (attribution in `sounds/SOURCES.txt`). We're shipping this with eyes open about habituation: it will work for days, then degrade as the cat learns the bark isn't followed by a dog. That's fine because **the speaker was never the primary defense for cats** — the phone notification is. The bark buys us a small window of actual deterrence on top of getting our attention to physically intervene.
+
+When the bark stops working, the next moves are layered audio (territorial hiss, see below) and hardware (motion-activated sprinkler).
+
+### What didn't work as audio (history)
+
+- **Ultrasonic 20 kHz**: speaker hardware limit, see above.
+- **Crow-style distress** (e.g. our crow files): would *attract* cats by signalling prey. Not used.
+- **Audible sirens/alarms**: cats startle once, then ignore. Not used.
 
 ### Territorial cat-hiss audio (not yet in the repo)
-Cat-on-cat threat audio — angry hissing, yowling, fight sequences — should work by triggering territorial avoidance rather than predator avoidance. Different psychology than dog-bark mimicry. Not included yet because we haven't sourced clean samples; would layer on top of ultrasonic, not replace it.
+Cat-on-cat threat audio — angry hissing, yowling, fight sequences — should work by triggering territorial avoidance rather than predator avoidance. Different psychology than dog-bark mimicry. Not included yet because we haven't sourced clean samples; should layer on top of dog bark, not replace it.
 
 ## How this changes the system design
 
@@ -60,17 +71,17 @@ Audio is opportunistic. The phone ping is the **real** defense, because a cat wi
 
 This is why the cat target in `crowbuster.py`:
 
-- Skips Claude refinement (`use_claude: False`) — YOLO's `cat` class is specific; no disambiguation needed
+- Uses Claude refinement (`use_claude: True`) — YOLO's `cat` class on its own fired phantom HUMAN ALARMs on raccoons, dark plush items, and shadows on textiles. Claude vetoes those before the refire counter can escalate to the human alarm.
 - Fires the phone alert immediately on rising-edge
 - Runs `active_hours: "always"` — cats are nocturnal and we can't afford to skip the night
-- Habituation escalation still plays `sounds/alarm.wav` + urgent phone ping (same as crow path)
+- Habituation escalation still plays `sounds/alarm.wav` + urgent phone ping (same as crow path). With `habituation_threshold: 1`, the very first persistent refire is the human alarm — that's why the Claude check matters.
 
-## Generation
+## Generation (ultrasonic — kept for historical reference)
 
-To regenerate or tune the ultrasonic file:
+If someone retries ultrasonic on hardware that can actually reproduce >18 kHz (a tweeter-rated wired speaker, an outdoor PA, etc.), regenerate with:
 
 ```bash
-# 20kHz, 8 seconds (current default)
+# 20kHz, 8 seconds
 sox -n -r 48000 -c 1 sounds/cat/ultrasonic-20khz.mp3 synth 8 sine 20000 vol 0.9
 
 # 18kHz fallback for speakers that roll off above 19kHz
@@ -80,13 +91,13 @@ sox -n -r 48000 -c 1 sounds/cat/ultrasonic-18khz.mp3 synth 8 sine 18000 vol 0.9
 sox -n -r 48000 -c 1 sounds/cat/ultrasonic-sweep.mp3 synth 10 sine 18000-22000 vol 0.9
 ```
 
-The script's shuffle deck picks one file at random per fire. Shipping multiple = variety + speaker-range hedging.
+The script's shuffle deck picks one file at random per fire. With the audible dog bark in play, dropping an ultrasonic file in would mix the two — fine if you want to A/B them.
 
 ## Open questions / future work
 
-- **Speaker reproduction**: does the porch Bluetooth speaker actually deliver 20kHz? You can't hear it — confirm by watching whether cats react over the next few weeks. If they don't, drop to 18kHz and retest.
-- **Territorial-hiss layer**: source 2-3 short hiss/yowl clips from freesound.org, drop into `sounds/cat/`. Should improve effectiveness vs ultrasonic alone, especially against habituated outdoor cats that have learned the porch is "safe."
-- **Motion-activated sprinkler**: per FERA and HSUS research, this is the gold-standard cat deterrent. Could be triggered by crowbuster's cat detection via a smart plug or relay. Out of scope for the audio-only branch but the right next move if ultrasonic underwhelms.
+- **Bark habituation curve**: track whether cat captures pick back up 1-2 weeks after deploying the bark. Expected; that's when the territorial-hiss layer becomes the next move.
+- **Territorial-hiss layer**: source 2-3 short hiss/yowl clips from freesound.org, drop into `sounds/cat/`. Should layer on top of dog bark, not replace it. Different psychology (territorial avoidance vs predator avoidance).
+- **Motion-activated sprinkler**: per FERA and HSUS research, this is the gold-standard cat deterrent. Could be triggered by crowbuster's cat detection via a smart plug or relay. Out of scope for the audio-only branch but the right next move if audio underwhelms.
 - **Effectiveness data**: track whether `_cat.jpg` captures decrease over the weeks after deployment. The events.log + captures dir already produce the data; needs a small analysis script.
 
 ## Further reading
